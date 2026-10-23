@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# --- Helper: Safety Confirmation ---
+confirm() {
+    read -r -p "${1:-Are you sure? [y/N]} " response
+    case "$response" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 1. Select Disk
+DISK=$(lsblk -dno NAME,SIZE,TYPE | grep disk | fzf --prompt="Select Disk > " | awk '{print "/dev/"$1}')
+[ -z "$DISK" ] && exit
+
+# 2. Choose Action
+ACTION=$(printf "Create New Partition\nCreate ESP (UEFI)\nFlag Existing as ESP\nFormat Existing Partition\nDelete Partition\nInfo" | fzf --prompt="Action > ")
+
+case "$ACTION" in
+    "Create New Partition")
+        read -p "Enter size (e.g., 50G): " SIZE
+        if confirm "Proceed with creating partition on $DISK?"; then
+            sudo parted "$DISK" mkpart primary ext4 1MiB "$SIZE"
+        fi
+        ;;
+
+    "Create ESP (UEFI)")
+        read -p "Enter ESP size (usually 512M): " SIZE
+        if confirm "Create 512MB EFI partition on $DISK?"; then
+            sudo parted "$DISK" mkpart primary fat32 1MiB "$SIZE"
+            PART_NUM=$(sudo parted "$DISK" print | tail -n 2 | head -n 1 | awk '{print $1}')
+            sudo parted "$DISK" set "$PART_NUM" esp on
+            sudo mkfs.vfat -F 32 "${DISK}${PART_NUM}"
+            echo "ESP created and formatted as FAT32."
+        fi
+        ;;
+
+    "Flag Existing as ESP")
+        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Flag as ESP > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
+        NUM=$(echo "$PART_NAME" | grep -o '[0-9]*$')
+        if confirm "Set 'esp' flag on /dev/$PART_NAME? This does not erase data."; then
+            sudo parted "$DISK" set "$NUM" esp on
+            echo "Partition $PART_NAME is now marked as ESP."
+        fi
+        ;;
+
+    "Format Existing Partition")
+        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Format > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
+        PART="/dev/$PART_NAME"
+        [ -z "$PART_NAME" ] && exit
+        
+        FS=$(printf "fat32\nntfs\nxfs\next4" | fzf --prompt="Select Filesystem > ")
+        
+        if confirm "FORMAT $PART as $FS? ALL DATA WILL BE LOST."; then
+            case "$FS" in
+                "fat32") sudo mkfs.vfat -F 32 "$PART" ;;
+                "ntfs")  sudo mkfs.ntfs -f "$PART" ;;
+                "xfs")   sudo mkfs.xfs -f "$PART" ;;
+                "ext4")  sudo mkfs.ext4 "$PART" ;;
+            esac
+            echo "Successfully formatted $PART."
+        fi
+        ;;
+
+    "Delete Partition")
+        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Delete > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
+        PART="/dev/$PART_NAME"
+        [ -z "$PART_NAME" ] && exit
+        
+        NUM=$(echo "$PART_NAME" | grep -o '[0-9]*$')
+        if confirm "DELETE $PART? This is irreversible."; then
+            sudo parted "$DISK" rm "$NUM"
+        fi
+        ;;
+
+    "Info")
+        sudo parted "$DISK" print
+        read -p "Press Enter to exit..."
+        ;;
+esac

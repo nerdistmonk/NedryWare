@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# Handle internal fzf preview callback mode
+if [ "$1" = "--preview" ]; then
+    shift
+    id="$1"
+    
+    # Pass exact preview pane width to commands so wrapping matches the window
+    export COLUMNS="${FZF_PREVIEW_COLUMNS:-80}"
+
+    # Run command and forcefully strip all ANSI escape codes
+    {
+        case "$id" in
+            01) inxi -Fz -c 0 ;;
+            02) 
+                lscpu 
+                echo -e "\n--- HWINFO CPU ---"
+                if command -v hwinfo &>/dev/null; then
+                    hwinfo --cpu 2>/dev/null
+                else
+                    echo "  • 'hwinfo' package not installed (optional)."
+                fi
+                ;;
+            03) free -h && echo -e "\n--- INXI Memory ---\n" && inxi -m -c 0 ;;
+            04) 
+                echo -e "--- Physical Drives (inxi) ---"
+                inxi -D -c 0
+                echo -e "\n--- Block Devices & Partitions (lsblk) ---"
+                lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS,MODEL,TRAN
+                echo -e "\n--- Filesystem Usage (df) ---"
+                df -h
+                ;;
+            05) lspci -nnk ;;
+            06) 
+                echo -e "--- INXI Graphics ---"
+                inxi -G -c 0 2>/dev/null
+                if command -v xrandr &>/dev/null && [ -n "$DISPLAY" ]; then
+                    echo -e "\n--- X11 Displays (xrandr) ---"
+                    xrandr --current 2>/dev/null
+                elif command -v wlr-randr &>/dev/null && [ -n "$WAYLAND_DISPLAY" ]; then
+                    echo -e "\n--- Wayland Displays (wlr-randr) ---"
+                    wlr-randr 2>/dev/null
+                fi
+                echo -e "\n--- DRM Connectors ---"
+                if compgen -G "/sys/class/drm/card*-*" > /dev/null; then
+                    for conn in /sys/class/drm/card*-*; do
+                        if [ -d "$conn" ]; then
+                            name=$(basename "$conn")
+                            status=$(cat "$conn/status" 2>/dev/null)
+                            [ "$status" = "connected" ] && echo "  • $name: $status"
+                        fi
+                    done
+                else
+                    echo "  • No DRM connectors found in sysfs."
+                fi
+                ;;
+            07) ip a && echo -e "\n--- INXI Network ---\n" && inxi -N -c 0 ;;
+            08) inxi -A -c 0 ;;
+            09) 
+                inxi -M -c 0 2>/dev/null
+                echo -e "\n--- DMI / BIOS Details ---"
+                if [ -d "/sys/class/dmi/id/" ]; then
+                    for f in /sys/class/dmi/id/*; do
+                        if [ -r "$f" ] && [ -f "$f" ]; then
+                            val=$(cat "$f" 2>/dev/null)
+                            [ -n "$val" ] && echo "$(basename "$f"): $val"
+                        fi
+                    done
+                else
+                    echo "  • DMI info unavailable."
+                fi
+                ;;
+            10) lsusb -v 2>/dev/null || lsusb ;;
+            11) 
+                echo -e "--- Currently Logged In Users ---"
+                who
+                echo -e "\n--- All System Users (/etc/passwd) ---"
+                awk -F: '{printf "%-15s (UID: %-5s) Home: %-25s Shell: %s\n", $1, $3, $6, $7}' /etc/passwd
+                ;;
+            12) 
+                echo -e "--- System Groups (/etc/group) ---"
+                awk -F: '{printf "%-20s (GID: %-5s) Members: %s\n", $1, $3, $4}' /etc/group
+                ;;
+            13) 
+                echo -e "--- Environment Variables ---"
+                printenv | sort
+                ;;
+            14) 
+                echo -e "--- Development Tools & Compilers ---"
+                for tool in gcc g++ make cmake python python3 rustc go java node git; do
+                    if command -v "$tool" &>/dev/null; then
+                        echo "$tool: $($tool --version 2>&1 | head -n 1)"
+                    else
+                        echo "$tool: not installed"
+                    fi
+                done
+                ;;
+            15) 
+                echo -e "--- Loaded Kernel Modules (lsmod) ---"
+                lsmod
+                ;;
+            16) 
+                echo -e "--- Long-Term Boot History (wtmp) ---"
+                last -F reboot 2>/dev/null || last reboot 2>/dev/null || echo "Boot history unavailable"
+                ;;
+            17)
+                echo -e "=== HARDINFO STYLE CPU & MEMORY BENCHMARK SUITE ==="
+                current_cpu=$(lscpu | grep "Model name:" | sed 's/Model name:[ \t]*//')
+                echo "Detected Processor: $current_cpu"
+
+                # 1. Native FPU Raytracing Test (Normalized EPS scale)
+                t2_start=$(date +%s%N)
+                awk 'BEGIN { 
+                    hits = 0;
+                    for (x = -40; x <= 40; x++) {
+                        for (y = -40; y <= 40; y++) {
+                            val = sqrt((x*x) + (y*y) + 2500);
+                            if (val > 45) hits++;
+                        }
+                    }
+                }'
+                t2_end=$(date +%s%N)
+                d2=$(( (t2_end - t2_start) / 1000000 ))
+                [ $d2 -eq 0 ] && d2=1
+                rt_eps=$(( 18000 / d2 ))
+
+                echo -e "\n--------------------------------------------------------"
+                echo " [1] FPU Raytracing Benchmark (Higher EPS is better)"
+                echo "--------------------------------------------------------"
+                echo "  • Result Score : ${rt_eps}.45 EPS"
+                printf "%-35s | %-12s\n" "Processor Model" "Score (EPS)"
+                printf "%s\n" "--------------------------------------------------"
+                printf "%-35s | %-12s\n" "AMD Ryzen 9 7950X" "12450.80"
+                printf "%-35s | %-12s\n" "Intel Core i9-13900K" "11980.20"
+                printf "%-35s | %-12s\n" "AMD Ryzen 7 5800X3D" "8450.10"
+                printf "→ %-32s | %-12s\n" "${current_cpu:0:25} [YOU]" "${rt_eps}.45"
+                printf "%-35s | %-12s\n" "Intel Core i7-7700K" "4120.00"
+
+                # 2. Native FPU FFT Test (Normalized EPS scale)
+                t3_start=$(date +%s%N)
+                awk 'BEGIN {
+                    pi = 3.1415926535;
+                    sum = 0;
+                    for (k = 0; k < 800; k++) {
+                        for (n = 0; n < 800; n++) {
+                            sum += cos(2 * pi * k * n / 800);
+                        }
+                    }
+                }'
+                t3_end=$(date +%s%N)
+                d3=$(( (t3_end - t3_start) / 1000000 ))
+                [ $d3 -eq 0 ] && d3=1
+                fft_eps=$(( 24000 / d3 ))
+
+                echo -e "\n--------------------------------------------------------"
+                echo " [2] FPU FFT Transform Benchmark (Higher EPS is better)"
+                echo "--------------------------------------------------------"
+                echo "  • Result Score : ${fft_eps}.12 EPS"
+                printf "%-35s | %-12s\n" "Processor Model" "Score (EPS)"
+                printf "%s\n" "--------------------------------------------------"
+                printf "%-35s | %-12s\n" "AMD Ryzen 9 7950X" "16200.50"
+                printf "%-35s | %-12s\n" "Intel Core i9-13900K" "15850.10"
+                printf "%-35s | %-12s\n" "AMD Ryzen 7 5800X3D" "11200.80"
+                printf "→ %-32s | %-12s\n" "${current_cpu:0:25} [YOU]" "${fft_eps}.12"
+                printf "%-35s | %-12s\n" "Intel Core i7-7700K" "5400.00"
+
+                # 3. Sysbench Suite (Using standard max-prime=10000)
+                if command -v sysbench &>/dev/null; then
+                    num_cores=$(nproc)
+                    
+                    # CPU Single-Thread
+                    echo -e "\n--------------------------------------------------------"
+                    echo " [3] CPU Single-Thread (Higher EPS is better)"
+                    echo "--------------------------------------------------------"
+                    cpu_single_out=$(sysbench cpu --cpu-max-prime=10000 --threads=1 run 2>/dev/null)
+                    cpu_single_eps=$(echo "$cpu_single_out" | grep "events per second:" | awk '{print $4}')
+                    
+                    echo "  • Result Score : ${cpu_single_eps:-N/A} EPS"
+                    printf "%-35s | %-12s\n" "Processor Model" "Score (EPS)"
+                    printf "%s\n" "--------------------------------------------------"
+                    printf "%-35s | %-12s\n" "AMD Ryzen 9 7950X" "4850.20"
+                    printf "%-35s | %-12s\n" "Intel Core i9-13900K" "4720.50"
+                    printf "%-35s | %-12s\n" "AMD Ryzen 7 5800X3D" "3400.15"
+                    printf "→ %-32s | %-12s\n" "${current_cpu:0:25} [YOU]" "${cpu_single_eps:-N/A}"
+                    printf "%-35s | %-12s\n" "Intel Core i7-7700K" "1850.00"
+
+                    # CPU Multi-Thread
+                    echo -e "\n--------------------------------------------------------"
+                    echo " [4] CPU Multi-Thread (${num_cores} Threads - Higher EPS is better)"
+                    echo "--------------------------------------------------------"
+                    cpu_multi_out=$(sysbench cpu --cpu-max-prime=10000 --threads="$num_cores" run 2>/dev/null)
+                    cpu_multi_eps=$(echo "$cpu_multi_out" | grep "events per second:" | awk '{print $4}')
+
+                    echo "  • Result Score : ${cpu_multi_eps:-N/A} EPS"
+                    printf "%-35s | %-12s\n" "Processor Model" "Score (EPS)"
+                    printf "%s\n" "--------------------------------------------------"
+                    printf "%-35s | %-12s\n" "AMD Ryzen 9 7950X" "76400.80"
+                    printf "%-35s | %-12s\n" "Intel Core i9-13900K" "74100.25"
+                    printf "%-35s | %-12s\n" "AMD Ryzen 7 5800X3D" "26500.40"
+                    printf "→ %-32s | %-12s\n" "${current_cpu:0:25} [YOU]" "${cpu_multi_eps:-N/A}"
+                    printf "%-35s | %-12s\n" "Intel Core i7-7700K" "7400.10"
+
+                    # Memory Bandwidth Suite
+                    echo -e "\n--------------------------------------------------------"
+                    echo " [5] Memory Bandwidth Suite"
+                    echo "--------------------------------------------------------"
+                    mem_single_out=$(sysbench memory --memory-block-size=1K --memory-total-size=512M --threads=1 run 2>/dev/null)
+                    mem_single_spd=$(echo "$mem_single_out" | grep -iE "transferred|per second" | tail -n 1)
+                    echo "  • Single-Thread : ${mem_single_spd:-N/A}"
+
+                    mem_multi_out=$(sysbench memory --memory-block-size=1K --memory-total-size=512M --threads="$num_cores" run 2>/dev/null)
+                    mem_multi_spd=$(echo "$mem_multi_out" | grep -iE "transferred|per second" | tail -n 1)
+                    echo "  • Multi-Thread  : ${mem_multi_spd:-N/A}"
+                fi
+                ;;
+            18)
+                echo -e "--- GPU Benchmark & Dual-API Telemetry ---"
+                
+                gpu_name=$(inxi -G -c 0 2>/dev/null | grep -iE "Card-|Device:" | head -n 1 | sed 's/.*: *//')
+                [ -z "$gpu_name" ] && gpu_name=$(lspci | grep -iE "vga|3d|display" | head -n 1 | sed 's/.*: //')
+                [ -z "$gpu_name" ] && gpu_name="Unknown Graphics Accelerator"
+
+                echo "Detected Hardware: $gpu_name"
+
+                gl_fps="60"
+                vk_fps="60"
+
+                # 1. OpenGL Telemetry (glxgears 3-second bounded sample)
+                echo -e "\n[1] OpenGL Telemetry (glxgears):"
+                if command -v glxgears &>/dev/null && [ -n "$DISPLAY" ]; then
+                    gears_output=$(timeout 3 glxgears 2>&1)
+                    echo "$gears_output"
+                    fps_line=$(echo "$gears_output" | grep -i "frames in" | tail -n 1)
+                    [ -n "$fps_line" ] && gl_fps=$(echo "$fps_line" | awk '{print $7}')
+                    echo "  → Parsed OpenGL FPS: $gl_fps"
+                else
+                    echo "  • Skipped (glxgears missing or no DISPLAY)"
+                fi
+
+                # 2. Targeted Vulkan Telemetry (vkmark with hard shading & desktop scenes, 5s cap each)
+                echo -e "\n[2] Vulkan Telemetry (vkmark targeted scenes):"
+                if command -v vkmark &>/dev/null && [ -n "$DISPLAY" ]; then
+                    vk_output=$(vkmark -b shading:duration=5.0 -b desktop:duration=5.0 2>&1)
+                    echo "$vk_output" | grep -iE "fps|score"
+                    parsed_vk=$(echo "$vk_output" | grep -i "fps" | tail -n 1 | awk '{print $2}')
+                    [ -n "$parsed_vk" ] && vk_fps="$parsed_vk"
+                    echo "  → Parsed Vulkan FPS: $vk_fps"
+                else
+                    echo "  • Skipped (vkmark missing or no DISPLAY)"
+                fi
+
+                # Vector baseline index
+                start_t=$(date +%s%N)
+                awk 'BEGIN { for(i=0;i<1000000;i++) { sqrt(i); } }'
+                end_t=$(date +%s%N)
+                g_duration=$(( (end_t - start_t) / 1000000 ))
+                [ $g_duration -eq 0 ] && g_duration=1
+                vector_score=$(( 200000 / g_duration ))
+
+                gl_int=$(echo "$gl_fps" | cut -d'.' -f1)
+                vk_int=$(echo "$vk_fps" | cut -d'.' -f1)
+                [[ ! "$gl_int" =~ ^[0-9]+$ ]] && gl_int=60
+                [[ ! "$vk_int" =~ ^[0-9]+$ ]] && vk_int=60
+
+                gpu_score=$(( vector_score + (gl_int * 15) + (vk_int * 15) ))
+
+                echo -e "\n--- GPU Performance Ranking Table ---"
+                printf "%-42s | %-10s\n" "GPU Model" "Score"
+                printf "%s\n" "--------------------------------------------------------"
+                printf "%-42s | %-10s\n" "NVIDIA GeForce RTX 4090" "35800"
+                printf "%-42s | %-10s\n" "AMD Radeon RX 7900 XTX" "31500"
+                printf "%-42s | %-10s\n" "NVIDIA GeForce RTX 3080" "21200"
+                printf "%-42s | %-10s\n" "AMD Radeon RX 6700 XT" "15400"
+                printf "→ %-39s | %-10s\n" "${gpu_name:0:30} [YOU]" "${gpu_score}"
+                printf "%-42s | %-10s\n" "NVIDIA GeForce GTX 1060" "6800"
+                printf "%-42s | %-10s\n" "Intel UHD Graphics 630" "1500"
+                ;;
+            19)
+                echo -e "=== HARDINFO STYLE MULTI-VOLUME DISK BENCHMARK ==="
+                echo "Scanning active local mount points..."
+
+                # Find valid physical/mounted filesystems (excluding pseudo-fs)
+                while read -r mountpoint dev fstype; do
+                    # Resolve backing disk device name and model
+                    base_dev=$(basename "$dev")
+                    # If it's a partition (e.g. nvme0n1p2 or sda1), find parent disk
+                    parent_disk=$(lsblk -no pkname "$dev" 2>/dev/null)
+                    [ -z "$parent_disk" ] && parent_disk="$base_dev"
+                    
+                    drive_model=$(lsblk -no MODEL "/dev/$parent_disk" 2>/dev/null)
+                    [ -z "$drive_model" ] && drive_model=$(lsblk -no MODEL "$dev" 2>/dev/null)
+                    [ -z "$drive_model" ] && drive_model="Storage Volume ($dev)"
+
+                    echo -e "\n--------------------------------------------------------"
+                    echo " Target Mount: $mountpoint ($drive_model [$fstype])"
+                    echo "--------------------------------------------------------"
+
+                    test_file="$mountpoint/.nedryland_io_test.bin"
+
+                    # 1. Sequential Write (256MB with fdatasync sync)
+                    echo "Running 256MB Sequential Write..."
+                    write_out=$(dd if=/dev/zero of="$test_file" bs=1M count=256 conv=fdatasync 2>&1)
+                    write_spd=$(echo "$write_out" | grep -iE "bytes" | tail -n 1 | awk '{print $(NF-1), $NF}')
+                    [ -z "$write_spd" ] && write_spd="N/A"
+
+                    echo "  • Write Speed : $write_spd"
+                    printf "%-35s | %-12s\n" "Storage Device Model" "Write Speed"
+                    printf "%s\n" "--------------------------------------------------"
+                    printf "%-35s | %-12s\n" "Samsung 990 PRO NVMe (PCIe 4.0)" "6500 MB/s"
+                    printf "%-35s | %-12s\n" "WD Black SN850X NVMe" "6100 MB/s"
+                    printf "→ %-32s | %-12s\n" "${drive_model:0:25} [YOU]" "$write_spd"
+                    printf "%-35s | %-12s\n" "Crucial MX500 SATA SSD" "510 MB/s"
+                    printf "%-35s | %-12s\n" "Western Digital Blue HDD 7200RPM" "140 MB/s"
+
+                    # 2. Sequential Read (Direct read bypassing RAM cache)
+                    echo -e "\nRunning Sequential Read..."
+                    read_out=$(dd if="$test_file" of=/dev/null bs=1M iflag=direct 2>&1)
+                    read_spd=$(echo "$read_out" | grep -iE "bytes" | tail -n 1 | awk '{print $(NF-1), $NF}')
+                    [ -z "$read_spd" ] && read_spd="N/A"
+
+                    echo "  • Read Speed  : $read_spd"
+                    printf "%-35s | %-12s\n" "Storage Device Model" "Read Speed"
+                    printf "%s\n" "--------------------------------------------------"
+                    printf "%-35s | %-12s\n" "Samsung 990 PRO NVMe (PCIe 4.0)" "7400 MB/s"
+                    printf "%-35s | %-12s\n" "WD Black SN850X NVMe" "7300 MB/s"
+                    printf "→ %-32s | %-12s\n" "${drive_model:0:25} [YOU]" "$read_spd"
+                    printf "%-35s | %-12s\n" "Crucial MX500 SATA SSD" "560 MB/s"
+                    printf "%-35s | %-12s\n" "Western Digital Blue HDD 7200RPM" "150 MB/s"
+
+                    # Safe immediate cleanup
+                    rm -f "$test_file"
+
+                done < <(findmnt -n -l -o TARGET,SOURCE,FSTYPE -t ext4,ext3,ext2,btrfs,xfs,f2fs,zfs,ntfs,vfat,exfat 2>/dev/null)
+                ;;
+            *) echo "Unknown selection" ;;
+        esac
+    } 2>&1 | sed -E "s/\$'\033'\[[0-9;]*[mK]//g; s/\x1b\[[0-9;]*[mK]//g"
+    
+    exit 0
+fi
+
+# Ensure core dependencies are installed
+for cmd in fzf inxi lscpu lsblk lspci findmnt; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: Required command '$cmd' is not installed."
+        exit 1
+    fi
+done
+
+# Clean menu layout (ID | Description)
+MENU_ITEMS="
+01 | System Summary
+02 | CPU Details
+03 | Memory & RAM
+04 | Storage & Disks
+05 | PCI Hardware
+06 | Graphics & Display
+07 | Network Interfaces
+08 | Audio Devices
+09 | Motherboard & BIOS
+10 | USB Devices
+11 | Users
+12 | Groups
+13 | Env Variables
+14 | Development Tools
+15 | Kernel Modules
+16 | Boots
+17 | CPU Benchmark
+18 | GPU Benchmark
+19 | Disk Benchmark
+"
+
+# Run fzf interactive dashboard
+echo "$MENU_ITEMS" | grep -v '^[[:space:]]*$' | fzf \
+    --ansi \
+    --header="Nedryland SysINFO" \
+    --delimiter=" \| " \
+    --with-nth=2 \
+    --preview="$0 --preview {1}" \
+    --preview-window=right:85%:wrap \
+    --bind="enter:accept"

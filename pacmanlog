@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Define the log path
+LOGFILE="/var/log/pacman.log"
+
+# Define colors
+RED=$'\033[31m'
+#CYAN=$'\033[36m'
+YELLOW=$'\033[1;33m'
+RESET=$'\033[0m'
+
+# Check if log file exists
+if [[ ! -f "$LOGFILE" ]]; then
+    echo "Error: $LOGFILE not found."
+    exit 1
+fi
+
+# Determine if we show all or just the last 100 lines
+if [[ "$1" == "--all" ]]; then
+    CMD="cat"
+else
+    CMD="tail -n 500"
+fi
+
+# Execute: Read file, colorize, and pipe to less
+$CMD "$LOGFILE" | sed -e "s/.*removed.*/${RED}&${RESET}/" \
+    -e "s/.*installed.*/${YELLOW}&${RESET}/" | less -R

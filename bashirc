@@ -1,0 +1,113 @@
+#!/bin/bash
+
+if [ -z "$BASH_VERSION" ]; then
+    echo -e "\033[31mError: This script must be run with the bash shell.\033[0m"
+    exit 1
+fi
+
+if ! command -v nc &>/dev/null; then
+    echo -e "\033[31mError: Netcat ('nc') is required for the chat loop.\033[0m"
+    exit 1
+fi
+
+clear
+echo -e "\033[36m=== Pathetic IRC Client (Deluxe Color Edition) ===\033[0m"
+echo ""
+
+read -p "Enter your Nickname [ArchUser]: " NICK
+NICK=${NICK:-ArchUser}
+
+read -p "Enter Channel [#archlinux]: " CHANNEL
+CHANNEL=${CHANNEL:-#archlinux}
+
+if [[ "$CHANNEL" != '#'* ]]; then
+    CHANNEL="#$CHANNEL"
+fi
+
+SERVER="irc.oftc.net"
+PORT="6667"
+
+# Create a FIFO for sending messages to the server
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+exec 3<> "$FIFO"
+
+# Launch a single netcat process:
+# - It reads outbound commands from our FIFO descriptor (3)
+# - Its inbound output is piped directly into our parser loop
+nc "$SERVER" "$PORT" <&3 | while IFS= read -r line; do
+    line="${line//\\r/}" # Strip carriage returns
+    
+    # 1. Auto-respond to server PING requests
+    if [[ "$line" =~ ^PING ]]; then
+        echo "${line/PING/PONG}" >&3
+        continue
+    fi
+    
+    timestamp=$(date +%H:%M:%S)
+
+    # 2. Parse Chat Messages (PRIVMSG)
+    if [[ "$line" =~ ^:([^!]+)!.*PRIVMSG[[:space:]]+([^[:space:]]+)[[:space:]]+:(.*)$ ]]; then
+        sender="${BASH_REMATCH[1]}"
+        target="${BASH_REMATCH[2]}"
+        msg="${BASH_REMATCH[3]}"
+        
+        # Ignore private CTCP version requests from services
+        [[ "$target" == "$NICK" && "$msg" =~ ^VERSION ]] && continue
+
+        if [ "$sender" != "$NICK" ]; then
+            echo -e "\033[2m[$timestamp]\033[0m \033[35m<$sender>\033[0m $msg"
+        fi
+        
+    # 3. Parse Joins
+    elif [[ "$line" =~ ^:([^!]+)!.*JOIN[[:space:]]+:(.*)$ ]]; then
+        sender="${BASH_REMATCH[1]}"
+        echo -e "\033[2m[$timestamp]\033[32m * $sender has joined $CHANNEL\033[0m"
+        
+    # 4. Parse Quits / Parts
+    elif [[ "$line" =~ ^:([^!]+)!.*(QUIT|PART) ]]; then
+        sender="${BASH_REMATCH[1]}"
+        echo -e "\033[2m[$timestamp]\033[31m * $sender has left\033[0m"
+        
+    # 5. Handle Notices cleanly (mute auth spam)
+    elif [[ "$line" =~ ^:[^[:space:]]+[[:space:]]+NOTICE ]]; then
+        continue
+        
+    # 6. SILENTLY DISCARD ALL OTHER SERVER NOISE (MOTD, numerics, NAMES lists, etc.)
+    else
+        continue
+    fi
+done &
+NC_PID=$!
+
+# Send initial handshake commands into the FIFO
+echo "NICK $NICK" >&3
+echo "USER $NICK 8 * :Arch Linux User" >&3
+echo "JOIN $CHANNEL" >&3
+
+echo -e "\n\033[32m✔ Connected to $CHANNEL as $NICK! Type your messages below (Ctrl+C or type /quit to exit).\033[0m\n"
+
+# Foreground loop for typing messages
+while true; do
+    read -r user_msg
+    [ -z "$user_msg" ] && continue
+    
+    if [[ "$user_msg" == "/quit" || "$user_msg" == "/exit" ]]; then
+        echo "QUIT :Leaving" >&3
+        break
+    fi
+    
+    # Send message to IRC via FIFO
+    echo "PRIVMSG $CHANNEL :$user_msg" >&3
+    
+    # Print locally with timestamp and styling
+    timestamp=$(date +%H:%M:%S)
+    echo -e "\033[2m[$timestamp]\033[0m \033[36m<$NICK>\033[0m $user_msg"
+done
+
+# Cleanup on exit
+exec 3>&-
+rm -f "$FIFO"
+kill $NC_PID 2>/dev/null
+clear
+echo -e "\033[33mDisconnected. Goodbye!\033[0m"

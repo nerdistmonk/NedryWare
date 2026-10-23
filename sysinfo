@@ -1,0 +1,4 @@
+#!/bin/sh
+clear
+inxi -Fxz
+read inxi

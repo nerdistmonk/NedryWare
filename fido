@@ -1,0 +1,4 @@
+#!/bin/bash
+echo Enter Search Query
+read DATA
+fzf --no-input -e -q "$DATA"

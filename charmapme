@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Ensure wl-clipboard is installed
+if ! command -v wl-copy &> /dev/null; then
+    echo "Error: wl-copy is not installed. Run: sudo pacman -S wl-clipboard"
+    exit 1
+fi
+
+# Generate Unicode list and pipe to fzf
+# We use Python to print the character, its hex code, and its name if possible
+# The range is limited to common printable characters to keep fzf responsive
+CHAR=$(python3 -c "
+import unicodedata
+for i in range(32, 2000):
+    try:
+        char = chr(i)
+        name = unicodedata.name(char)
+        print(f'{char}  {hex(i)}  {name}')
+    except:
+        continue
+" | fzf --height=80% --layout=reverse --prompt="Search Unicode > " | awk '{print $1}')
+
+# If a character was selected, copy it
+if [ -n "$CHAR" ]; then
+    echo -n "$CHAR" | wl-copy
+    echo "Copied '$CHAR' to Wayland clipboard."
+fi

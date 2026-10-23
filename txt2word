@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+
+INPUT_FILE="$1"
+OUTPUT_FILE="${2:-output.rtf}"
+
+if [ -z "$INPUT_FILE" ] || [ ! -f "$INPUT_FILE" ]; then
+    echo "Usage: ./txt2rtf.sh <input.txt> [output.rtf]"
+    exit 1
+fi
+
+if ! command -v fzf &> /dev/null; then
+    echo "Error: 'fzf' is required but not installed."
+    exit 1
+fi
+
+echo "Scanning system fonts..."
+FONTS=$(fc-list : family 2>/dev/null | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sort -u)
+
+if [ -z "$FONTS" ]; then
+    FONTS=$'Arial\nCalibri\nTimes New Roman\nCourier New\nGeorgia\nVerdana'
+fi
+
+# Read all lines into an array
+mapfile -t lines < "$INPUT_FILE"
+total_lines=${#lines[@]}
+
+if [ "$total_lines" -eq 0 ]; then
+    echo "Error: Input file is empty."
+    exit 1
+fi
+
+declare -A line_fonts
+
+# --- Phase 1: Two-Step Range Batch Selection ---
+while true; do
+    # Step 1: Pick Start Line
+    start_sel=$(nl -ba "$INPUT_FILE" | fzf \
+        --layout=reverse \
+        --prompt="[1/2] Select START line (ESC to finish batching) > " \
+        --header="Choose the beginning of your line range" \
+        --preview="nl -ba '$INPUT_FILE'" \
+        --preview-window="right,50%,wrap")
+
+    if [ -z "$start_sel" ]; then
+        break
+    fi
+    start_idx=$(echo "$start_sel" | awk '{print $1}')
+
+    # Step 2: Pick End Line
+    end_sel=$(nl -ba "$INPUT_FILE" | fzf \
+        --layout=reverse \
+        --prompt="[2/2] Select END line (Start: $start_idx) > " \
+        --header="Choose the end of your line range" \
+        --preview="nl -ba '$INPUT_FILE'" \
+        --preview-window="right,50%,wrap")
+
+    if [ -z "$end_sel" ]; then
+        break
+    fi
+    end_idx=$(echo "$end_sel" | awk '{print $1}')
+
+    if [ "$start_idx" -gt "$end_idx" ]; then
+        temp="$start_idx"
+        start_idx="$end_idx"
+        end_idx="$temp"
+    fi
+
+    # Step 3: Select Font for this range
+    chosen_batch_font=$(echo "$FONTS" | fzf \
+        --layout=reverse \
+        --prompt="Font for lines $start_idx to $end_idx > " \
+        --header="Select a font family for this range")
+
+    if [ -z "$chosen_batch_font" ]; then
+        continue
+    fi
+
+    for ((i=start_idx; i<=end_idx; i++)); do
+        line_fonts[$i]="$chosen_batch_font"
+    done
+    echo "Applied '$chosen_batch_font' to lines $start_idx-$end_idx."
+done
+
+# --- Phase 2: Individual Review for Remaining Lines ---
+for ((i=1; i<=total_lines; i++)); do
+    if [ -n "${line_fonts[$i]}" ]; then
+        continue
+    fi
+
+    line="${lines[$((i-1))]%$'\r'}"
+    if [ -z "$line" ]; then
+        line_fonts[$i]="Arial"
+        continue
+    fi
+
+    # Calculate safe preview offset so it auto-scrolls to the current line safely
+    preview_offset=$(( i > 5 ? i - 5 : 1 ))
+
+    # Pick font for individual line with current line highlighted and preview pre-scrolled
+    chosen_font=$(echo "$FONTS" | fzf \
+        --layout=reverse \
+        --prompt="[LINE $i/$total_lines] Select font > " \
+        --header="Line text: $line" \
+        --preview="nl -ba '$INPUT_FILE' | sed \"${i}s/^/> /\" | tail -n +$preview_offset" \
+        --preview-window="right,50%,wrap")
+
+    if [ -z "$chosen_font" ]; then
+        chosen_font="Arial"
+    fi
+
+    line_fonts[$i]="$chosen_font"
+done
+
+# --- Phase 3: Generate RTF Document ---
+echo -e "\nGenerating RTF document..."
+
+declare -A unique_fonts_map
+unique_fonts=()
+
+for ((i=1; i<=total_lines; i++)); do
+    f="${line_fonts[$i]}"
+    if [ -z "${unique_fonts_map[$f]}" ]; then
+        unique_fonts_map[$f]=1
+        unique_fonts+=("$f")
+    fi
+done
+
+rtf_content="{\\rtf1\\ansi\\deff0\n"
+
+# Font Table
+rtf_content+="{\\fonttbl\n"
+for idx in "${!unique_fonts[@]}"; do
+    font_name="${unique_fonts[$idx]}"
+    rtf_content+="{\\f${idx}\\fnil ${font_name};}\n"
+done
+rtf_content+="}\n"
+
+declare -A font_to_index
+for idx in "${!unique_fonts[@]}"; do
+    font_to_index["${unique_fonts[$idx]}"]="$idx"
+done
+
+# Document Body
+rtf_content+="\\pard\\fs24\n"
+
+for ((i=1; i<=total_lines; i++)); do
+    line="${lines[$((i-1))]%$'\r'}"
+    if [ -z "$line" ]; then
+        rtf_content+="\\par\n"
+        continue
+    fi
+    
+    font="${line_fonts[$i]}"
+    f_idx="${font_to_index[$font]}"
+    
+    # Escape RTF special characters
+    safe_line=$(echo "$line" | sed 's/\\/\\\\/g; s/{/\\{/g; s/}/\\}/g')
+    
+    rtf_content+="{\\f${f_idx} ${safe_line}}\\par\n"
+done
+
+rtf_content+="}\n"
+
+echo "$rtf_content" > "$OUTPUT_FILE"
+echo "Success! Word-compatible RTF document saved as: $OUTPUT_FILE"

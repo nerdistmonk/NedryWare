@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Get a list of block devices, filtered for partitions only
+DEVICE=$(lsblk -o NAME,SIZE,MOUNTPOINT,LABEL,TYPE -nr | grep "part" | fzf --height 40% --reverse --header="Select drive to Mount/Unmount")
+
+if [ -z "$DEVICE" ]; then exit 0; fi
+
+# With your output: "sda1 7.3T /media/ARDAT ARDAT part"
+# $1 = NAME, $2 = SIZE, $3 = MOUNTPOINT
+DEV_NAME=$(echo "$DEVICE" | awk '{print $1}')
+MOUNT_POINT=$(echo "$DEVICE" | awk '{print $3}')
+
+# If MOUNT_POINT is literally the word "part" (meaning it wasn't mounted), 
+# then it's actually empty. 
+# We check if the MOUNT_POINT contains a slash "/"
+if [[ "$MOUNT_POINT" == *"/"* ]]; then
+    udisksctl unmount -b "/dev/$DEV_NAME" && notify-send "Drive $DEV_NAME unmounted"
+else
+    udisksctl mount -b "/dev/$DEV_NAME" && notify-send "Drive $DEV_NAME mounted"
+fi

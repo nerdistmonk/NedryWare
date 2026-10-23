@@ -1,0 +1,21 @@
+#!/bin/bash
+
+OUTPUT="/tmp/font_preview.png"
+TEXT="The quick brown fox jumps over the lazy dog"
+
+# 1. Select the font
+FONT_FAMILY=$(fc-list : family | cut -d, -f1 | sort -u | fzf --prompt="Select Font > ")
+[ -z "$FONT_FAMILY" ] && exit
+
+# 2. Get the actual file path to the font
+# This fixes the "unable to read font" error by pointing to the exact .ttf/.otf file
+FONT_PATH=$(fc-match -f "%{file}" "$FONT_FAMILY")
+
+# 3. Render using 'magick' (v7 compliant)
+# We use the full path to the font file here
+magick -background white -fill black -font "$FONT_PATH" -pointsize 32 label:"$TEXT" "$OUTPUT"
+
+# 4. View
+if [ -f "$OUTPUT" ]; then
+    swayimg "$OUTPUT"
+fi

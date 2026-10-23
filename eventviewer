@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Use PID in the state filename to avoid collisions, with safe exit cleanup
+STATE_FILE="/tmp/journal_state_$$"
+echo "false false false" > "$STATE_FILE"
+trap 'rm -f "$STATE_FILE"' EXIT
+
+build_cmd() {
+    read -r x b p < "$STATE_FILE"
+    local cmd="journalctl -n 500 --no-pager"
+    [[ "$x" == "true" ]] && cmd="$cmd -rx"
+    [[ "$b" == "true" ]] && cmd="$cmd -rb"
+    [[ "$p" == "true" ]] && cmd="$cmd -rp 4"
+    echo "$cmd"
+}
+
+while true; do
+    # Read current state flags for the header
+    read -r x b p < "$STATE_FILE"
+
+    # Generate dynamic status indicators for the fzf header
+    h_x=$([[ "$x" == "true" ]] && echo "[ON]" || echo "[OFF]")
+    h_b=$([[ "$b" == "true" ]] && echo "[ON]" || echo "[OFF]")
+    h_p=$([[ "$p" == "true" ]] && echo "[ON]" || echo "[OFF]")
+    
+    header="[Ctrl-x: Rev $h_x] [Ctrl-b: Boot $h_b] [Ctrl-p: Err $h_p] [Ctrl-c: Clear] | [Enter: Copy] [Esc: Quit]"
+
+    # Run fzf with SYSTEMD_COLORS=1 and --ansi to render colors properly
+    SELECTION=$(SYSTEMD_COLORS=1 $(build_cmd) | fzf --height 100% --reverse --ansi \
+        --header="$header" \
+        --expect=ctrl-x,ctrl-b,ctrl-p,ctrl-c)
+
+    # Exit if fzf returns nothing (Esc or closed)
+    [ -z "$SELECTION" ] && break
+
+    KEY=$(head -n 1 <<< "$SELECTION")
+    CONTENT=$(sed '1d' <<< "$SELECTION")
+
+    case "$KEY" in
+        ctrl-x|ctrl-b|ctrl-p)
+            # Toggle the appropriate flag and save state
+            [[ "$KEY" == "ctrl-x" ]] && x=$([[ "$x" == "true" ]] && echo "false" || echo "true")
+            [[ "$KEY" == "ctrl-b" ]] && b=$([[ "$b" == "true" ]] && echo "false" || echo "true")
+            [[ "$KEY" == "ctrl-p" ]] && p=$([[ "$p" == "true" ]] && echo "false" || echo "true")
+            echo "$x $b $p" > "$STATE_FILE"
+            ;;
+        ctrl-c)
+            # Clear kernel ring buffer and rotate/vacuum systemd journal (keeping last 24h)
+            sudo dmesg -C
+            sudo journalctl --rotate --vacuum-time=1d
+            notify-send "Event Viewer" "Logs cleaned successfully!"
+            ;;
+        "")
+            # If content is empty, user hit Enter with nothing selected or hit Esc
+            [ -z "$CONTENT" ] && break
+            
+            # Strip ANSI color codes before copying to clipboard so raw text is clean
+            CLEAN_CONTENT=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$CONTENT")
+
+            # Copy to clipboard (supports Wayland wl-copy with fallback to xclip)
+            if command -v wl-copy &>/dev/null; then
+                printf "%s" "$CLEAN_CONTENT" | wl-copy
+            elif command -v xclip &>/dev/null; then
+                printf "%s" "$CLEAN_CONTENT" | xclip -selection clipboard
+            fi
+            
+            notify-send "Journal Entry" "Copied to clipboard!"
+            ;;
+    esac
+done

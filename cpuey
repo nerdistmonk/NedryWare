@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# Ensure the script is run with bash
+if [ -z "$BASH_VERSION" ]; then
+    echo -e "\033[31mError: This script must be run with the bash shell.\033[0m"
+    exit 1
+fi
+
+# Ensure fzf is installed
+if ! command -v fzf &>/dev/null; then
+    echo -e "\033[31mError: 'fzf' is required but not installed.\033[0m"
+    exit 1
+fi
+
+# Clear the screen at the start of the program
+clear
+
+# Locate CPU files
+CPU_GOV_FILE="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+CPU_AVAIL_FILE="/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+CPU_ENABLED=false
+[ -f "$CPU_GOV_FILE" ] && [ -f "$CPU_AVAIL_FILE" ] && CPU_ENABLED=true
+
+# Locate AMD GPU files
+GPU_AMD_FILE=$(ls /sys/class/drm/card*/device/power_dpm_force_performance_level 2>/dev/null | head -n 1)
+GPU_AMD_ENABLED=false
+[ -n "$GPU_AMD_FILE" ] && [ -f "$GPU_AMD_FILE" ] && GPU_AMD_ENABLED=true
+
+# Locate NVIDIA GPU support via nvidia-smi
+GPU_NVIDIA_ENABLED=false
+if command -v nvidia-smi &>/dev/null && nvidia-smi -L &>/dev/null; then
+    GPU_NVIDIA_ENABLED=true
+fi
+
+if [ "$CPU_ENABLED" = false ] && [ "$GPU_AMD_ENABLED" = false ] && [ "$GPU_NVIDIA_ENABLED" = false ]; then
+    echo -e "\033[31mError: No supported CPU scaling or GPU power controls were found on this system.\033[0m"
+    exit 1
+fi
+
+# Build available hardware options dynamically
+available_devices=()
+[ "$CPU_ENABLED" = true ] && available_devices+=("CPU Governor")
+[ "$GPU_AMD_ENABLED" = true ] && available_devices+=("AMD GPU Performance Level")
+[ "$GPU_NVIDIA_ENABLED" = true ] && available_devices+=("NVIDIA GPU Persistence Mode")
+available_devices+=("Quit without changes")
+
+TARGET_DEVICE="cpu"
+if [ "${#available_devices[@]}" -gt 2 ]; then
+    DEVICE_HEADER="Select target hardware to manage:"
+    SELECTED_DEVICE=$(printf '%s\n' "${available_devices[@]}" | fzf --height 35% --reverse \
+        --header="$DEVICE_HEADER" \
+        --color="header:italic:yellow,spinner:green,pointer:cyan")
+    
+    [ -z "$SELECTED_DEVICE" ] || [[ "$SELECTED_DEVICE" == *"Quit"* ]] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    [[ "$SELECTED_DEVICE" == *"CPU"* ]] && TARGET_DEVICE="cpu"
+    [[ "$SELECTED_DEVICE" == *"AMD"* ]] && TARGET_DEVICE="gpu_amd"
+    [[ "$SELECTED_DEVICE" == *"NVIDIA"* ]] && TARGET_DEVICE="gpu_nvidia"
+elif [ "$CPU_ENABLED" = false ] && [ "$GPU_AMD_ENABLED" = true ]; then
+    TARGET_DEVICE="gpu_amd"
+elif [ "$CPU_ENABLED" = false ] && [ "$GPU_NVIDIA_ENABLED" = true ]; then
+    TARGET_DEVICE="gpu_nvidia"
+fi
+
+# ==========================================
+# CPU MANAGEMENT BLOCK
+# ==========================================
+if [ "$TARGET_DEVICE" == "cpu" ]; then
+    CURRENT_GOV=$(cat "$CPU_GOV_FILE")
+    AVAILABLE_GOVS=$(cat "$CPU_AVAIL_FILE")
+    read -r -a GOV_ARRAY <<< "$AVAILABLE_GOVS"
+
+    avg_freq=0
+    count=0
+    for freq_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+        if [ -f "$freq_file" ]; then
+            freq=$(cat "$freq_file")
+            avg_freq=$((avg_freq + freq))
+            count=$((count + 1))
+        fi
+    done
+
+    FREQ_STR="N/A"
+    [ "$count" -gt 0 ] && FREQ_STR="$((avg_freq / count / 1000)) MHz"
+
+    HEADER="Current CPU Governor: [ $CURRENT_GOV ] | Avg Speed: [ $FREQ_STR ]
+Use arrow keys to select a governor (Enter to apply, Esc to quit):"
+
+    fzf_options=()
+    for gov in "${GOV_ARRAY[@]}"; do
+        [ "$gov" == "$CURRENT_GOV" ] && fzf_options+=("$gov (active)") || fzf_options+=("$gov")
+    done
+    fzf_options+=("Quit without changes")
+
+    SELECTED_LINE=$(printf '%s\n' "${fzf_options[@]}" | fzf --height 40% --reverse \
+        --header="$HEADER" \
+        --color="header:italic:yellow,spinner:green,pointer:cyan")
+
+    [ -z "$SELECTED_LINE" ] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    TARGET_GOV=$(awk '{print $1}' <<< "$SELECTED_LINE")
+    [[ "$TARGET_GOV" == "Quit" ]] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    [ "$TARGET_GOV" == "$CURRENT_GOV" ] && { echo -e "\033[32mGovernor is already set to '$TARGET_GOV'.\033[0m"; exit 0; }
+
+    echo -e "\033[36mApplying '$TARGET_GOV' CPU governor to all cores...\033[0m"
+    echo "$TARGET_GOV" | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+
+    NEW_GOV=$(cat "$CPU_GOV_FILE")
+    if [ "$NEW_GOV" == "$TARGET_GOV" ]; then
+        echo -e "\033[32m✔ Success! CPU governor is now set to: $NEW_GOV\033[0m"
+        command -v notify-send &>/dev/null && notify-send "CPUeY" "CPU governor changed to $NEW_GOV"
+    else
+        echo -e "\033[31m✖ Error: Failed to change CPU governor.\033[0m"
+        exit 1
+    fi
+
+# ==========================================
+# AMD GPU MANAGEMENT BLOCK
+# ==========================================
+elif [ "$TARGET_DEVICE" == "gpu_amd" ]; then
+    CURRENT_GPU_LEVEL=$(cat "$GPU_AMD_FILE")
+    GPU_LEVELS=("auto" "low" "high" "manual")
+
+    HEADER="Current AMD GPU Level: [ $CURRENT_GPU_LEVEL ]
+Use arrow keys to select a performance level (Enter to apply, Esc to quit):"
+
+    fzf_options=()
+    for lvl in "${GPU_LEVELS[@]}"; do
+        [ "$lvl" == "$CURRENT_GPU_LEVEL" ] && fzf_options+=("$lvl (active)") || fzf_options+=("$lvl")
+    done
+    fzf_options+=("Quit without changes")
+
+    SELECTED_LINE=$(printf '%s\n' "${fzf_options[@]}" | fzf --height 40% --reverse \
+        --header="$HEADER" \
+        --color="header:italic:yellow,spinner:green,pointer:cyan")
+
+    [ -z "$SELECTED_LINE" ] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    TARGET_GPU_LEVEL=$(awk '{print $1}' <<< "$SELECTED_LINE")
+    [[ "$TARGET_GPU_LEVEL" == "Quit" ]] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    [ "$TARGET_GPU_LEVEL" == "$CURRENT_GPU_LEVEL" ] && { echo -e "\033[32mGPU level is already set to '$TARGET_GPU_LEVEL'.\033[0m"; exit 0; }
+
+    echo -e "\033[36mApplying '$TARGET_GPU_LEVEL' to AMD GPU...\033[0m"
+    echo "$TARGET_GPU_LEVEL" | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level > /dev/null
+
+    NEW_GPU_LEVEL=$(cat "$GPU_AMD_FILE")
+    if [ "$NEW_GPU_LEVEL" == "$TARGET_GPU_LEVEL" ]; then
+        echo -e "\033[32m✔ Success! AMD GPU performance level is now set to: $NEW_GPU_LEVEL\033[0m"
+        command -v notify-send &>/dev/null && notify-send "CPUeY" "AMD GPU level changed to $NEW_GPU_LEVEL"
+    else
+        echo -e "\033[31m✖ Error: Failed to change AMD GPU performance level.\033[0m"
+        exit 1
+    fi
+
+# ==========================================
+# NVIDIA GPU MANAGEMENT BLOCK
+# ==========================================
+elif [ "$TARGET_DEVICE" == "gpu_nvidia" ]; then
+    CURRENT_MODE=$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader,nounits | head -n 1 | tr -d '[:space:]')
+    NVIDIA_OPTIONS=("Enabled" "Disabled")
+
+    HEADER="Current NVIDIA Persistence Mode: [ $CURRENT_MODE ]
+Use arrow keys to select mode (Enter to apply, Esc to quit):"
+
+    fzf_options=()
+    for mode in "${NVIDIA_OPTIONS[@]}"; do
+        [ "$mode" == "$CURRENT_MODE" ] && fzf_options+=("$mode (active)") || fzf_options+=("$mode")
+    done
+    fzf_options+=("Quit without changes")
+
+    SELECTED_LINE=$(printf '%s\n' "${fzf_options[@]}" | fzf --height 40% --reverse \
+        --header="$HEADER" \
+        --color="header:italic:yellow,spinner:green,pointer:cyan")
+
+    [ -z "$SELECTED_LINE" ] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    TARGET_MODE=$(awk '{print $1}' <<< "$SELECTED_LINE")
+    [[ "$TARGET_MODE" == "Quit" ]] && { echo -e "\n\033[33mExited. No changes made.\033[0m"; exit 0; }
+    [ "$TARGET_MODE" == "$CURRENT_MODE" ] && { echo -e "\033[32mNVIDIA persistence mode is already set to '$TARGET_MODE'.\033[0m"; exit 0; }
+
+    pm_val="1"
+    [ "$TARGET_MODE" == "Disabled" ] && pm_val="0"
+
+    echo -e "\033[36mApplying persistence mode '$TARGET_MODE' to NVIDIA GPU...\033[0m"
+    sudo nvidia-smi -pm "$pm_val" > /dev/null
+
+    NEW_MODE=$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader,nounits | head -n 1 | tr -d '[:space:]')
+    if [ "$NEW_MODE" == "$TARGET_MODE" ]; then
+        echo -e "\033[32m✔ Success! NVIDIA persistence mode is now set to: $NEW_MODE\033[0m"
+        command -v notify-send &>/dev/null && notify-send "CPUeY" "NVIDIA persistence mode changed to $NEW_MODE"
+    else
+        echo -e "\033[31m✖ Error: Failed to change NVIDIA persistence mode.\033[0m"
+        exit 1
+    fi
+fi

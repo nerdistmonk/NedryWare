@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+# Define the log path
+LOGFILE="/var/log/pacman.log"
+
+# ANSI Colors
+ORANGE=$'\033[38;5;208m'
+RED=$'\033[1;31m'
+YELLOW=$'\033[1;33m'
+RESET=$'\033[0m'
+
+# Check if log file exists
+if [[ ! -f "$LOGFILE" ]]; then
+    echo "Error: $LOGFILE not found."
+    exit 1
+fi
+
+# Logic:
+# 1. Reverse the log with 'tac' (newest at top)
+# 2. Filter for only meaningful lines (sed -n ... p)
+# 3. Take the first 100 matches (head)
+# 4. Do NOT reverse back, so newest stays at top
+if [[ "$1" == "--all" ]]; then
+    tac "$LOGFILE" | sed -n -e "s/.*removed.*/${RED}&${RESET}/p" \
+                            -e "s/.*installed.*/${YELLOW}&${RESET}/p" \
+                            -e "s/.*error.*/${ORANGE}&${RESET}/p" | less -R
+else
+    tac "$LOGFILE" | sed -n -e "s/.*removed.*/${RED}&${RESET}/p" \
+                            -e "s/.*installed.*/${YELLOW}&${RESET}/p" \
+                            -e "s/.*error.*/${ORANGE}&${RESET}/p" \
+                            | head -n 500 | less -R
+fi

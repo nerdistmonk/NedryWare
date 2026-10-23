@@ -1,0 +1,24 @@
+#!/bin/sh
+
+# 1. Setup paths
+FILE="$1"
+NAME=$(basename "$FILE" | sed 's/\.[^.]*$//')
+TMP_DIR="/tmp/comic_view/$NAME"
+
+# Safe extraction
+mkdir -p "$TMP_DIR"
+
+# 2. Extract based on type
+case "$FILE" in
+    *.cbz) unzip -q "$FILE" -d "$TMP_DIR" ;;
+    *.cbr) unrar x -inul "$FILE" "$TMP_DIR" ;;
+    *) echo "Unknown format"; exit 1 ;;
+esac
+
+# 3. Apply your BMP/Resize transformation
+# We process the images to your preferred format for the viewer
+find "$TMP_DIR" -type f \( -iname "*.jpg" -o -iname "*.png" -o -iname "*.jpeg" \) -exec mogrify -resize 1024x768 -format bmp {} \;
+
+# 4. Open in swayimg
+cd "$TMP_DIR"
+swayimg *.bmp

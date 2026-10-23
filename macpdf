@@ -1,0 +1,4 @@
+#!/bin/bash
+pdftops "$1" output.ps
+ps2pdf13 output.ps output.pdf
+rm output.ps

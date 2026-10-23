@@ -1,0 +1,132 @@
+#!/bin/bash
+
+CONFIG="$HOME/.config/pipewire/defaulteq.txt"
+DISABLED_CONFIG="${CONFIG}.disabled"
+
+if [ ! -f "$CONFIG" ] && [ ! -f "$DISABLED_CONFIG" ]; then
+    echo "Error: No config found at $CONFIG"
+    exit 1
+fi
+
+# Initial state check
+if [ -f "$CONFIG" ]; then
+    ACTIVE_CONFIG="$CONFIG"
+    EQ_STATUS="ACTIVE"
+else
+    ACTIVE_CONFIG="$DISABLED_CONFIG"
+    EQ_STATUS="DISABLED"
+fi
+
+while true; do
+    display_menu=""
+    while IFS= read -r line; do
+        if [[ "$line" == Preamp* ]]; then
+            val=$(echo "$line" | awk '{print $2}')
+            unit=$(echo "$line" | awk '{print $3}')
+            display_menu+="Preamp: ${val}${unit:-db}"$'\n'
+        elif [[ "$line" == Filter* ]]; then
+            f_num=$(echo "$line" | awk '{print $2}' | tr -d ':')
+            hz=$(echo "$line" | grep -oP 'Fc \K[0-9.]+')
+            gain=$(echo "$line" | grep -oP 'Gain \K[-0-9.]+')
+            q=$(echo "$line" | grep -oP 'Q \K[0-9.]+')
+            
+            display_menu+="Band ${f_num}: ${hz}Hz - ${gain}dB - Q${q}"$'\n'
+        fi
+    done < "$ACTIVE_CONFIG"
+
+    OUTPUT=$(echo -n "$display_menu" | fzf --header="=== EQ [$EQ_STATUS] | ^r: Reset PW | ^d: Toggle EQ ===" --prompt="Select band > " --expect=ctrl-r,ctrl-d)
+    
+    KEY=$(echo -n "$OUTPUT" | head -n 1)
+    CHOICE=$(echo -n "$OUTPUT" | tail -n +2)
+    
+    [ -z "$CHOICE" ] && [ -z "$KEY" ] && exit 0
+
+    # Handle Ctrl + r: Full PipeWire Reset
+    if [ "$KEY" = "ctrl-r" ]; then
+        pactl set-sink-mute @DEFAULT_SINK@ 1 &>/dev/null
+        echo -e "\n\e[33mRestarting PipeWire services in silence...\e[0m"
+        systemctl --user restart pipewire pipewire-pulse wireplumber
+        sleep 1
+        
+        EQ_SINK=$(pactl list short sinks | grep -iE 'eq|equalizer|filter' | awk '{print $2}' | head -n 1)
+        [ -n "$EQ_SINK" ] && pactl set-default-sink "$EQ_SINK"
+        
+        pactl set-sink-mute @DEFAULT_SINK@ 0 &>/dev/null
+        echo -e "\e[32mPipeWire reset complete and unmuted!\e[0m\n"
+        sleep 1
+        continue
+    fi
+
+    # Handle Ctrl + d: Toggle Equalizer safely with hard-mute protection
+    if [ "$KEY" = "ctrl-d" ]; then
+        # 1. INSTANT SILENCE: Mute master audio before anything else happens
+        pactl set-sink-mute @DEFAULT_SINK@ 1 &>/dev/null
+        sleep 0.1
+
+        if [ "$ACTIVE_CONFIG" = "$CONFIG" ]; then
+            mv "$CONFIG" "$DISABLED_CONFIG"
+            sync
+            ACTIVE_CONFIG="$DISABLED_CONFIG"
+            EQ_STATUS="DISABLED"
+            echo -e "\n\e[31mEqualizer disabled (bypassed)\e[0m"
+        else
+            mv "$DISABLED_CONFIG" "$CONFIG"
+            sync
+            ACTIVE_CONFIG="$CONFIG"
+            EQ_STATUS="ACTIVE"
+            echo -e "\n\e[32mEqualizer enabled (restored)\e[0m"
+        fi
+        
+        # 2. Restart services while audio is completely muted
+        systemctl --user restart pipewire
+        sleep 0.5
+        systemctl --user restart wireplumber &>/dev/null
+        sleep 1
+
+        # 3. Route to the correct sink
+        if [ "$EQ_STATUS" = "ACTIVE" ]; then
+            EQ_SINK=$(pactl list short sinks | grep -iE 'eq|equalizer|filter' | awk '{print $2}' | head -n 1)
+            [ -n "$EQ_SINK" ] && pactl set-default-sink "$EQ_SINK"
+        else
+            PHYS_SINK=$(pactl list short sinks | grep -viE 'eq|equalizer|filter' | awk '{print $2}' | head -n 1)
+            [ -n "$PHYS_SINK" ] && pactl set-default-sink "$PHYS_SINK"
+        fi
+
+        # 4. Safe to unmute now that routing and services are fully settled
+        pactl set-sink-mute @DEFAULT_SINK@ 0 &>/dev/null
+        sleep 1
+        continue
+    fi
+
+    # Handle standard band/preamp selection edits
+    if [[ "$CHOICE" == Preamp* ]]; then
+        echo -e "\n--- Adjusting Preamp ---"
+        echo "Current selection: $CHOICE"
+        read -p "Enter new preamp value in dB (e.g., -23): " new_val
+        if [[ -n "$new_val" ]]; then
+            clean_val="${new_val//[!0-9.-]/}"
+            sed -i "s/^Preamp:.*/Preamp: ${clean_val} db/" "$ACTIVE_CONFIG"
+            echo -e "\e[32mPreamp updated to ${clean_val} db!\e[0m\n"
+            sleep 1
+        fi
+
+    elif [[ "$CHOICE" == Band* ]]; then
+        band_num=$(echo "$CHOICE" | awk '{print $2}' | tr -d ':')
+        
+        echo -e "\n--- Tuning Band $band_num ---"
+        echo "Current: $CHOICE"
+        
+        read -p "Enter new Gain in dB (leave blank to skip): " new_gain
+        read -p "Enter new Q factor (leave blank to skip): " new_q
+        
+        if [ -n "$new_gain" ]; then
+            sed -i "/^Filter $band_num:/s/Gain [-0-9.]\+/Gain $new_gain/" "$ACTIVE_CONFIG"
+        fi
+        if [ -n "$new_q" ]; then
+            sed -i "/^Filter $band_num:/s/Q [0-9.-]\+/Q $new_q/" "$ACTIVE_CONFIG"
+        fi
+        
+        echo -e "\e[32mBand $band_num updated!\e[0m\n"
+        sleep 1
+    fi
+done

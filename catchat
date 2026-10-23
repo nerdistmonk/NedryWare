@@ -1,0 +1,143 @@
+#!/bin/bash
+
+clear
+# ANSI Color Definitions
+C_YOU="\033[1;36m"   # Bold Cyan
+C_PEER="\033[1;32m"  # Bold Green
+C_SYS="\033[1;33m"   # Bold Yellow
+C_TIME="\033[90m"    # Gray for timestamps
+C_RESET="\033[0m"
+
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+
+cleanup() {
+    rm -f "$FIFO"
+    # Kill any lingering background file transfer listeners
+    pkill -P $$ nc 2>/dev/null
+    echo -e "\n${C_SYS}[*] Chat session closed.${C_RESET}"
+    exit 0
+}
+
+trap cleanup EXIT INT TERM
+
+MODE=$1
+
+# Prompt for Username first
+read -p "Enter your username [default: ${USER:-chatuser}]: " USERNAME
+USERNAME=${USERNAME:-${USER:-chatuser}}
+
+if [ "$MODE" = "listen" ]; then
+    PORT=$2
+    if [ -z "$PORT" ]; then
+        read -p "Enter port to listen on [default: 9000]: " input_port
+        PORT=${input_port:-9000}
+    fi
+    
+    echo -e "${C_SYS}[*] Waiting for incoming connection on port $PORT as '$USERNAME'...${C_RESET}"
+    
+    exec 3<> "$FIFO"
+
+    nc -l "$PORT" <&3 | while IFS= read -r line; do
+        TS=$(date '+%H:%M:%S')
+        
+        # Check if the incoming message is a file transfer offer
+        if [[ "$line" == __FILE_OFFER__:* ]]; then
+            IFS=':' read -r _ file_port filename filesig <<< "$line"
+            echo -e "\r${C_TIME}[$TS]${C_RESET} ${C_SYS}[System] Incoming file: '$filename'. Receiving...${C_RESET}"
+            
+            # Automatically spin up a background listener to grab the file
+            nc -l "$file_port" > "./received_$filename" 2>/dev/null &
+            
+            echo -e "${C_SYS}[System] File saved as 'received_$filename'${C_RESET}"
+            echo -ne "${C_YOU}[$USERNAME]> ${C_RESET}"
+        else
+            echo -e "\r${C_TIME}[$TS]${C_RESET} ${C_PEER}$line${C_RESET}"
+            echo -ne "${C_YOU}[$USERNAME]> ${C_RESET}"
+        fi
+    done &
+
+elif [ "$MODE" = "connect" ]; then
+    IP=$2
+    PORT=$3
+
+    if [ -z "$IP" ]; then
+        read -p "Enter target IP address: " IP
+    fi
+    [ -z "$IP" ] && { echo "Error: Target IP is required."; exit 1; }
+
+    if [ -z "$PORT" ]; then
+        read -p "Enter target port [default: 9000]: " input_port
+        PORT=${input_port:-9000}
+    fi
+
+    echo -e "${C_SYS}[*] Connecting to $IP:$PORT as '$USERNAME'...${C_RESET}"
+
+    exec 3<> "$FIFO"
+
+    nc "$IP" "$PORT" <&3 | while IFS= read -r line; do
+        TS=$(date '+%H:%M:%S')
+        
+        if [[ "$line" == __FILE_OFFER__:* ]]; then
+            IFS=':' read -r _ file_port filename filesig <<< "$line"
+            echo -e "\r${C_TIME}[$TS]${C_RESET} ${C_SYS}[System] Incoming file: '$filename'. Receiving...${C_RESET}"
+            
+            nc -l "$file_port" > "./received_$filename" 2>/dev/null &
+            
+            echo -e "${C_SYS}[System] File saved as 'received_$filename'${C_RESET}"
+            echo -ne "${C_YOU}[$USERNAME]> ${C_RESET}"
+        else
+            echo -e "\r${C_TIME}[$TS]${C_RESET} ${C_PEER}$line${C_RESET}"
+            echo -ne "${C_YOU}[$USERNAME]> ${C_RESET}"
+        fi
+    done &
+
+else
+    echo "Usage:"
+    echo "  Server: ./catchat.sh listen [PORT]"
+    echo "  Client: ./catchat.sh connect [IP] [PORT]"
+    exit 1
+fi
+
+# Main input loop
+while IFS= read -r -p "$(echo -e "${C_YOU}[$USERNAME]> ${C_RESET}")" line; do
+    if [ "$line" = "/quit" ]; then
+        break
+    fi
+    
+    # Handle file transfer command: /send <path>
+    if [[ "$line" == /send* ]]; then
+        filepath=$(echo "$line" | cut -d' ' -f2-)
+        if [ ! -f "$filepath" ]; then
+            echo -e "${C_SYS}[Error] File not found: $filepath${C_RESET}"
+            continue
+        fi
+        
+        filename=$(basename "$filepath")
+        file_port=$((PORT + 100)) # Pick an ephemeral side-channel port
+        
+        echo -e "${C_SYS}[System] Sending $filename to peer...${C_RESET}"
+        
+        # 1. Send metadata offer over the chat pipe
+        echo "__FILE_OFFER__:$file_port:$filename" >&3
+        
+        # 2. Give the peer a brief moment to open their listener, then stream the file
+        sleep 0.5
+        
+        # If we are the connector, we stream to the peer's IP on the transfer port
+        # If we are the listener, we stream to localhost (or peer IP if known)
+        if [ "$MODE" = "connect" ]; then
+            target_ip="$IP"
+        else
+            target_ip="127.0.0.1" # For local testing; over network, you could auto-detect or prompt
+        fi
+        
+        nc "$target_ip" "$file_port" < "$filepath"
+        echo -e "${C_SYS}[System] Transfer complete!${C_RESET}"
+        continue
+    fi
+
+    if [ -n "$line" ]; then
+        echo "$USERNAME: $line" >&3
+    fi
+done

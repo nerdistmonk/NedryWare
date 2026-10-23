@@ -1,0 +1,24 @@
+#!/bin/sh
+
+# 1. Define paths
+PDF_FILE="$1"
+PDF_NAME=$(basename "$PDF_FILE" .pdf)
+TMP_DIR="/tmp/pdf_view/$PDF_NAME"
+
+# Clean up any old run first
+#rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
+
+# 2. Convert PDF to PNG pages
+pdftoppm -png "$PDF_FILE" "$TMP_DIR/page"
+
+# 3. Apply your BMP/Resize transformation
+# Use mogrify to process all at once
+#mogrify -resize 800x800 -format bmp "$TMP_DIR"/*.png
+
+# 4. Open in swayimg
+# We use an array-like approach by letting the shell expand the glob 
+# to a list of files. By navigating to the directory first, 
+# we ensure swayimg sees the individual files.
+cd "$TMP_DIR"
+swayimg *.png

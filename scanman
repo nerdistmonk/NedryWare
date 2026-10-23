@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+# Ensure required commands are available
+for cmd in fzf scanimage; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: Required command '$cmd' is not installed." >&2
+        exit 1
+    fi
+done
+
+# 1. Select Scanner Device
+echo "Detecting scanners..."
+devices=$(scanimage -f "%d (%v %m) [%i]\n")
+
+if [ -z "$devices" ]; then
+    echo "No SANE scanners found. Check your connection or permissions." >&2
+    exit 1
+fi
+
+selected_device_line=$(echo "$devices" | fzf --prompt="Select Scanner > " --height=30% --layout=reverse)
+[ -z "$selected_device_line" ] && exit 0
+
+# Extract device name/ID from brackets (e.g., [genesys:libusb:001:002])
+device_name=$(echo "$selected_device_line" | sed -n '.*\[\(.*\)\].*/\1/p')
+# Fallback extraction if sed pattern differs slightly
+if [ -z "$device_name" ]; then
+    device_name=$(echo "$selected_device_line" | awk -F'[' '{print $2}' | tr -d ']')
+fi
+
+# 2. Select Color Mode
+mode=$(printf "Color\nGray\nLineart" | fzf --prompt="Select Scan Mode > " --height=30% --layout=reverse)
+[ -z "$mode" ] && exit 0
+
+# 3. Select Resolution (DPI)
+resolution=$(printf "150\n300\n600\n1200" | fzf --prompt="Select Resolution (DPI) > " --height=30% --layout=reverse)
+[ -z "$resolution" ] && exit 0
+
+# 4. Select Output Format
+format=$(printf "pdf\njpg\npng" | fzf --prompt="Select Output Format > " --height=30% --layout=reverse)
+[ -z "$format" ] && exit 0
+
+# Output file naming
+out_dir="$HOME/Scans"
+mkdir -p "$out_dir"
+timestamp=$(date +%Y%m%d_%H%M%S)
+output_file="$out_dir/scan_$timestamp.$format"
+
+echo "Scanning using device: $device_name..."
+echo "Mode: $mode | Resolution: ${resolution}DPI"
+
+# Execute scanimage command
+if [ "$format" = "pdf" ]; then
+    # Scan to a temporary jpeg, then convert cleanly via img2pdf
+    tmp_img=$(mktemp --suffix=.jpg)
+    scanimage --device="$device_name" --mode="$mode" --resolution="$resolution" --format=jpeg > "$tmp_img"
+    
+    if command -v img2pdf &>/dev/null; then
+        img2pdf "$tmp_img" -o "$output_file"
+        rm "$tmp_img"
+    else
+        output_file="${output_file%.pdf}.jpg"
+        mv "$tmp_img" "$output_file"
+        echo "Note: 'img2pdf' not found. Saved as JPEG instead: $output_file"
+    fi
+else
+    scanimage --device="$device_name" --mode="$mode" --resolution="$resolution" --format="$format" > "$output_file"
+fi
+
+echo "Scan complete! Saved to: $output_file"
+
+# Optional: Terminal image preview if 'viu' is installed
+if command -v viu &>/dev/null && [ "$format" != "pdf" ]; then
+    viu "$output_file"
+fi

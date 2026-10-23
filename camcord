@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+APP_NAME="Desktop Recorder"
+VIDEOS_DIR="$HOME/Videos"
+TMP_DIR="/tmp"
+TMP_MP4="$TMP_DIR/recording_temp.mp4"
+TMP_UNOPT_GIF="$TMP_DIR/recording_unoptimized.gif"
+TMP_PALETTE="$TMP_DIR/palette.png"
+
+is_recorder_running() {
+    pgrep -x wf-recorder >/dev/null
+}
+
+notify() {
+    notify-send -a "$APP_NAME" "$1"
+}
+
+# Universal Toggle: If recording is active, stop it immediately
+if is_recorder_running; then
+    pkill -x wf-recorder
+    notify "Recording stopped."
+    exit 0
+fi
+
+# 1. Prompt user for mode using fzf
+mode=$(printf "Region GIF (to Clipboard & File)\nFullscreen GIF (to Clipboard & File)\nRegion MP4 (with Audio -> Videos/)\nFullscreen MP4 (with Audio -> Videos/)" | fzf --prompt="Select Recording Mode > ")
+[[ -z "$mode" ]] && exit 0
+
+# 2. Prompt user for recording duration/timer (applies to all options)
+duration_choice=$(printf "Manual Stop (Until Toggle / Hotkey)\n5 Seconds\n10 Seconds\n30 Seconds\n60 Seconds\nCustom Duration..." | fzf --prompt="Select Recording Duration > ")
+[[ -z "$duration_choice" ]] && exit 0
+
+timeout_sec=0
+if [[ "$duration_choice" == *"5 Seconds"* ]]; then
+    timeout_sec=5
+elif [[ "$duration_choice" == *"10 Seconds"* ]]; then
+    timeout_sec=10
+elif [[ "$duration_choice" == *"30 Seconds"* ]]; then
+    timeout_sec=30
+elif [[ "$duration_choice" == *"60 Seconds"* ]]; then
+    timeout_sec=60
+elif [[ "$duration_choice" == *"Custom"* ]]; then
+    read -rp "Enter duration in seconds: " custom_sec
+    timeout_sec="${custom_sec:-10}"
+fi
+
+# 3. Prompt user for GIF optimization preference (GIF modes only)
+optimize_gif_flag=false
+if [[ "$mode" == *"GIF"* ]]; then
+    opt_choice=$(printf "Optimized with Gifsicle (Smaller file size)\nUnoptimized (Fast processing / Larger file)" | fzf --prompt="GIF Quality / Speed > ")
+    [[ -z "$opt_choice" ]] && exit 0
+    if [[ "$opt_choice" == *"Optimized"* ]]; then
+        optimize_gif_flag=true
+    fi
+fi
+
+# 4. Prompt user for Audio Source selection (MP4 modes only)
+audio_arg=""
+if [[ "$mode" == *"MP4"* ]]; then
+    audio_options="No Sound (Video Only)\neasyeffects_sink.monitor (Default)"
+    if command -v pactl &>/dev/null; then
+        system_sources=$(pactl list short sources 2>/dev/null | awk '{print $2}')
+        if [[ -n "$system_sources" ]]; then
+            audio_options="$audio_options\n$system_sources"
+        fi
+    fi
+
+    audio_choice=$(echo -e "$audio_options" | fzf --prompt="Select Audio Source > ")
+    [[ -z "$audio_choice" ]] && exit 0
+
+    if [[ "$audio_choice" != *"No Sound"* ]]; then
+        selected_source=$(echo "$audio_choice" | awk '{print $1}')
+        audio_arg="--audio=$selected_source"
+    fi
+fi
+
+mkdir -p "$VIDEOS_DIR"
+
+case "$mode" in
+    *"Region GIF"*)
+        geometry=$(slurp)
+        [[ -z "$geometry" ]] && exit 0
+        
+        timestamp=$(date +"%Y-%m-%d_%I-%M-%S-%p")
+        final_gif="$VIDEOS_DIR/recording-$timestamp.gif"
+
+        notify "Started capturing region GIF..."
+        rm -f "$TMP_MP4" "$final_gif" "$TMP_UNOPT_GIF" "$TMP_PALETTE"
+        
+        if [ "$timeout_sec" -gt 0 ]; then
+            timeout "$timeout_sec" wf-recorder -g "$geometry" -f "$TMP_MP4"
+            ret=$?
+        else
+            wf-recorder -g "$geometry" -f "$TMP_MP4"
+            ret=$?
+        fi
+        
+        if [[ ! -f "$TMP_MP4" || ! -s "$TMP_MP4" ]]; then
+            notify "Recording was cancelled or failed."
+            rm -f "$TMP_MP4" "$TMP_PALETTE" "$TMP_UNOPT_GIF"
+            exit 0
+        fi
+
+        if [ $ret -eq 124 ]; then
+            notify "Post-processing started. Timer reached (${timeout_sec}s)."
+        else
+            notify "Post-processing started. GIF capture stopped."
+        fi
+        
+        ffmpeg -y -i "$TMP_MP4" -filter_complex "[0:v] palettegen" "$TMP_PALETTE"
+        ffmpeg -y -i "$TMP_MP4" -i "$TMP_PALETTE" -filter_complex "[0:v] fps=10,scale=720:-1 [new];[new][1:v] paletteuse" "$TMP_UNOPT_GIF"
+        
+        if [ "$optimize_gif_flag" = true ] && command -v gifsicle &>/dev/null; then
+            gifsicle -O3 --lossy=100 -i "$TMP_UNOPT_GIF" -o "$final_gif"
+        else
+            mv "$TMP_UNOPT_GIF" "$final_gif"
+        fi
+        
+        rm -f "$TMP_MP4" "$TMP_PALETTE" "$TMP_UNOPT_GIF"
+        
+        if command -v wl-copy &>/dev/null; then
+            wl-copy -t image/png < "$final_gif"
+        fi
+        
+        notify "GIF capture completed. Saved to clipboard and $final_gif"
+        ;;
+
+    *"Fullscreen GIF"*)
+        geometry=$(slurp -o)
+        [[ -z "$geometry" ]] && exit 0
+        
+        timestamp=$(date +"%Y-%m-%d_%I-%M-%S-%p")
+        final_gif="$VIDEOS_DIR/recording-$timestamp.gif"
+
+        notify "Started capturing fullscreen GIF..."
+        rm -f "$TMP_MP4" "$final_gif" "$TMP_UNOPT_GIF" "$TMP_PALETTE"
+        
+        if [ "$timeout_sec" -gt 0 ]; then
+            timeout "$timeout_sec" wf-recorder -g "$geometry" -f "$TMP_MP4"
+            ret=$?
+        else
+            wf-recorder -g "$geometry" -f "$TMP_MP4"
+            ret=$?
+        fi
+        
+        if [[ ! -f "$TMP_MP4" || ! -s "$TMP_MP4" ]]; then
+            notify "Recording was cancelled or failed."
+            rm -f "$TMP_MP4" "$TMP_PALETTE" "$TMP_UNOPT_GIF"
+            exit 0
+        fi
+
+        if [ $ret -eq 124 ]; then
+            notify "Post-processing started. Timer reached (${timeout_sec}s)."
+        else
+            notify "Post-processing started. GIF capture stopped."
+        fi
+        
+        ffmpeg -y -i "$TMP_MP4" -filter_complex "[0:v] palettegen" "$TMP_PALETTE"
+        ffmpeg -y -i "$TMP_MP4" -i "$TMP_PALETTE" -filter_complex "[0:v] fps=10,scale=1280:-1 [new];[new][1:v] paletteuse" "$TMP_UNOPT_GIF"
+        
+        if [ "$optimize_gif_flag" = true ] && command -v gifsicle &>/dev/null; then
+            gifsicle -O3 --lossy=100 -i "$TMP_UNOPT_GIF" -o "$final_gif"
+        else
+            mv "$TMP_UNOPT_GIF" "$final_gif"
+        fi
+        
+        rm -f "$TMP_MP4" "$TMP_PALETTE" "$TMP_UNOPT_GIF"
+        
+        if command -v wl-copy &>/dev/null; then
+            wl-copy -t image/png < "$final_gif"
+        fi
+        
+        notify "Fullscreen GIF capture completed. Saved to clipboard and $final_gif"
+        ;;
+
+    *"Region MP4"*)
+        geometry=$(slurp)
+        [[ -z "$geometry" ]] && exit 0
+        
+        timestamp=$(date +"%Y-%m-%d_%I-%M-%S-%p")
+        mp4_file="$VIDEOS_DIR/recording-$timestamp.mp4"
+        
+        notify "Started capturing Region MP4 video."
+        if [ "$timeout_sec" -gt 0 ]; then
+            timeout "$timeout_sec" wf-recorder $audio_arg -g "$geometry" -f "$mp4_file"
+        else
+            wf-recorder $audio_arg -g "$geometry" -f "$mp4_file"
+        fi
+        
+        notify "Capture completed: $mp4_file"
+        ;;
+
+    *"Fullscreen MP4"*)
+        geometry=$(slurp -o)
+        [[ -z "$geometry" ]] && exit 0
+        
+        timestamp=$(date +"%Y-%m-%d_%I-%M-%S-%p")
+        mp4_file="$VIDEOS_DIR/recording-$timestamp.mp4"
+        
+        notify "Started capturing Fullscreen MP4 video."
+        if [ "$timeout_sec" -gt 0 ]; then
+            timeout "$timeout_sec" wf-recorder $audio_arg -g "$geometry" -f "$mp4_file"
+        else
+            wf-recorder $audio_arg -g "$geometry" -f "$mp4_file"
+        fi
+        
+        notify "Capture completed: $mp4_file"
+        ;;
+esac
