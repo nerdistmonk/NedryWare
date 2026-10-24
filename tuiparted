@@ -1,6 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# --- Helper: Safety Confirmation ---
+set -euo pipefail
+
+# --- Root Escalation ---
+if [[ $EUID -ne 0 ]]; then
+    echo "Privileged operations require root. Re-executing with sudo..."
+    exec sudo "$0" "$@"
+fi
+
+# --- Helper Functions ---
 confirm() {
     read -r -p "${1:-Are you sure? [y/N]} " response
     case "$response" in
@@ -9,72 +17,892 @@ confirm() {
     esac
 }
 
-# 1. Select Disk
-DISK=$(lsblk -dno NAME,SIZE,TYPE | grep disk | fzf --prompt="Select Disk > " | awk '{print "/dev/"$1}')
-[ -z "$DISK" ] && exit
+get_partition_path() {
+    local disk="$1"
+    local part_num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        echo "${disk}p${part_num}"
+    else
+        echo "${disk}${part_num}"
+    fi
+}
 
-# 2. Choose Action
-ACTION=$(printf "Create New Partition\nCreate ESP (UEFI)\nFlag Existing as ESP\nFormat Existing Partition\nDelete Partition\nInfo" | fzf --prompt="Action > ")
-
-case "$ACTION" in
-    "Create New Partition")
-        read -p "Enter size (e.g., 50G): " SIZE
-        if confirm "Proceed with creating partition on $DISK?"; then
-            sudo parted "$DISK" mkpart primary ext4 1MiB "$SIZE"
+ensure_unmounted() {
+    local dev="$1"
+    if findmnt -n "$dev" >/dev/null 2>&1; then
+        echo "Device $dev is currently mounted!"
+        if confirm "Attempt to unmount $dev now?"; then
+            umount "$dev" || { echo "Failed to unmount $dev"; return 1; }
+        else
+            return 1;
         fi
-        ;;
+    fi
+    return 0
+}
 
-    "Create ESP (UEFI)")
-        read -p "Enter ESP size (usually 512M): " SIZE
-        if confirm "Create 512MB EFI partition on $DISK?"; then
-            sudo parted "$DISK" mkpart primary fat32 1MiB "$SIZE"
-            PART_NUM=$(sudo parted "$DISK" print | tail -n 2 | head -n 1 | awk '{print $1}')
-            sudo parted "$DISK" set "$PART_NUM" esp on
-            sudo mkfs.vfat -F 32 "${DISK}${PART_NUM}"
-            echo "ESP created and formatted as FAT32."
+ensure_disk_unmounted() {
+    local disk="$1"
+    local mounts
+    mounts=$(lsblk -pn -o MOUNTPOINT "$disk" 2>/dev/null | grep -v '^$' || true)
+    if [[ -n "$mounts" ]]; then
+        echo "Active mount points detected on $disk:"
+        echo "$mounts"
+        if confirm "Attempt to unmount all active partitions on $disk?"; then
+            while read -r mpoint; do
+                [[ -n "$mpoint" ]] && umount "$mpoint" || { echo "Failed to unmount $mpoint"; return 1; }
+            done <<< "$mounts"
+        else
+            return 1
         fi
-        ;;
+    fi
+    return 0
+}
 
-    "Flag Existing as ESP")
-        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Flag as ESP > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
-        NUM=$(echo "$PART_NAME" | grep -o '[0-9]*$')
-        if confirm "Set 'esp' flag on /dev/$PART_NAME? This does not erase data."; then
-            sudo parted "$DISK" set "$NUM" esp on
-            echo "Partition $PART_NAME is now marked as ESP."
+list_disks() {
+    lsblk -pnd -o NAME,SIZE,MODEL | while read -r dev size model; do
+        mounts=$(lsblk -pn -o MOUNTPOINT "$dev" 2>/dev/null | grep -v '^$' | tr '\n' ' ' | xargs || true)
+        if [[ -z "$mounts" ]]; then
+            mounts="unmounted"
         fi
-        ;;
+        printf "%-16s %-8s [%-22s] %s\n" "$dev" "$size" "$mounts" "$model"
+    done
+}
 
-    "Format Existing Partition")
-        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Format > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
-        PART="/dev/$PART_NAME"
-        [ -z "$PART_NAME" ] && exit
+select_partition() {
+    local disk="$1"
+    local part_line
+    part_line=$(lsblk -pln -o NAME,TYPE,SIZE,MOUNTPOINT,LABEL "$disk" | awk '$2=="part"' | fzf --prompt="Select Partition > " || true)
+    if [[ -n "$part_line" ]]; then
+        echo "$part_line" | awk '{print $1}'
+    fi
+}
+
+select_free_space() {
+    local disk="$1"
+    local free_space
+    free_space=$(parted -m -s "$disk" unit MiB print free 2>/dev/null | grep ':free;' || true)
+
+    if [[ -z "$free_space" ]]; then
+        echo "No unallocated space found on $disk." >&2
+        return 1
+    fi
+
+    echo "$free_space" | awk -F':' '{printf "Start: %-10s End: %-10s Size: %s\n", $2, $3, $4}' | fzf --prompt="Select Unallocated Space > " || true
+}
+
+create_partition_table() {
+    local disk="$1"
+    echo "=== Create Partition Table on $disk ==="
+    ensure_disk_unmounted "$disk" || return 0
+
+    local label_type
+    label_type=$(printf "gpt (Modern / UEFI / >2TB)\nmsdos (Legacy MBR / BIOS)" | fzf --prompt="Select Partition Table Type > " || true)
+    [ -z "$label_type" ] && return 0
+
+    label_type=$(echo "$label_type" | awk '{print $1}')
+
+    echo "WARNING: Creating a new $label_type partition table will OVERWRITE the existing partition layout on $disk."
+    if confirm "Are you sure you want to initialize a new $label_type partition table on $disk?"; then
+        parted -s "$disk" mklabel "$label_type"
+        partprobe "$disk" 2>/dev/null || true
+        udevadm settle
+        echo "Partition table initialized as $label_type on $disk."
+    fi
+}
+
+label_filesystem() {
+    local part="$1"
+    ensure_unmounted "$part" || return 0
+
+    local fstype
+    fstype=$(lsblk -no FSTYPE "$part" || true)
+
+    if [[ -z "$fstype" ]]; then
+        echo "Could not detect filesystem type on $part."
+        return 0
+    fi
+
+    local current_label
+    current_label=$(lsblk -no LABEL "$part" || true)
+    echo "Partition: $part"
+    echo "Filesystem: $fstype"
+    echo "Current Label: ${current_label:-[None]}"
+
+    read -r -p "Enter new filesystem label: " NEW_LABEL
+    [ -z "$NEW_LABEL" ] && { echo "Label operation cancelled."; return 0; }
+
+    if confirm "Set label of $part ($fstype) to '$NEW_LABEL'?"; then
+        case "$fstype" in
+            ext2|ext3|ext4)
+                e2label "$part" "$NEW_LABEL"
+                ;;
+            xfs)
+                xfs_admin -L "$NEW_LABEL" "$part"
+                ;;
+            vfat|fat32|fat16|fat)
+                if command -v fatlabel >/dev/null 2>&1; then
+                    fatlabel "$part" "$NEW_LABEL"
+                elif command -v dosfslabel >/dev/null 2>&1; then
+                    dosfslabel "$part" "$NEW_LABEL"
+                else
+                    echo "Neither fatlabel nor dosfslabel found. Please install dosfstools."
+                    return 0
+                fi
+                ;;
+            ntfs)
+                ntfslabel "$part" "$NEW_LABEL"
+                ;;
+            *)
+                echo "Filesystem type '$fstype' is not supported for labeling by this script."
+                return 0
+                ;;
+        esac
+        echo "Successfully set label for $part to '$NEW_LABEL'."
+    fi
+}
+
+take_ownership() {
+    local part="$1"
+    local target_user="${SUDO_USER:-$USER}"
+
+    if [[ "$target_user" == "root" ]]; then
+        read -r -p "Enter username to transfer ownership to: " target_user
+        [ -z "$target_user" ] && return 0
+    fi
+
+    if ! id "$target_user" >/dev/null 2>&1; then
+        echo "Error: User '$target_user' does not exist."
+        return 0
+    fi
+
+    local target_group
+    target_group=$(id -gn "$target_user")
+
+    local mountpoint
+    mountpoint=$(findmnt -n -o TARGET "$part" || true)
+    local temp_mounted=false
+
+    if [[ -z "$mountpoint" ]]; then
+        echo "Partition $part is not currently mounted."
+        if confirm "Temporarily mount $part to set ownership?"; then
+            mountpoint=$(mktemp -d /tmp/tuiparted_mount.XXXXXX)
+            if ! mount "$part" "$mountpoint"; then
+                echo "Failed to mount $part at $mountpoint."
+                rmdir "$mountpoint"
+                return 0
+            fi
+            temp_mounted=true
+        else
+            return 0
+        fi
+    fi
+
+    echo "Target Location: $mountpoint"
+    echo "New Owner: $target_user:$target_group"
+
+    if confirm "Change ownership of $mountpoint and all its contents to $target_user:$target_group?"; then
+        chown -R "$target_user:$target_group" "$mountpoint"
+        chmod 755 "$mountpoint"
+        echo "Ownership successfully updated to $target_user:$target_group."
+    fi
+
+    if [[ "$temp_mounted" == "true" ]]; then
+        umount "$mountpoint"
+        rmdir "$mountpoint"
+        echo "Cleaned up temporary mount point."
+    fi
+}
+
+check_repair_fs() {
+    local part="$1"
+    
+    ensure_unmounted "$part" || return 0
+
+    local fstype
+    fstype=$(lsblk -no FSTYPE "$part" || true)
+
+    if [[ -z "$fstype" ]]; then
+        echo "Could not detect filesystem type on $part."
+        return 0
+    fi
+
+    echo "Partition: $part"
+    echo "Detected Filesystem: $fstype"
+
+    local mode
+    mode=$(printf "Check Only (Safe / Read-Only)\nCheck & Automatically Repair" | fzf --prompt="Select Operation Mode > " || true)
+    [ -z "$mode" ] && return 0
+
+    if ! confirm "Proceed with '$mode' on $part ($fstype)?"; then
+        return 0
+    fi
+
+    case "$fstype" in
+        ext2|ext3|ext4)
+            if [[ "$mode" == "Check Only (Safe / Read-Only)" ]]; then
+                fsck.ext4 -f -n "$part"
+            else
+                fsck.ext4 -f -p "$part" || fsck.ext4 -f -y "$part"
+            fi
+            ;;
+        xfs)
+            if [[ "$mode" == "Check Only (Safe / Read-Only)" ]]; then
+                xfs_repair -n "$part"
+            else
+                xfs_repair "$part"
+            fi
+            ;;
+        vfat|fat32|fat16|fat)
+            if [[ "$mode" == "Check Only (Safe / Read-Only)" ]]; then
+                fsck.vfat -v -n "$part"
+            else
+                fsck.vfat -v -a "$part"
+            fi
+            ;;
+        ntfs)
+            if command -v ntfsfix >/dev/null 2>&1; then
+                if [[ "$mode" == "Check Only (Safe / Read-Only)" ]]; then
+                    ntfsfix -n "$part"
+                else
+                    ntfsfix "$part"
+                fi
+            else
+                echo "ntfsfix command not found. Please install ntfs-3g."
+                return 0
+            fi
+            ;;
+        *)
+            echo "Filesystem '$fstype' is not supported for check/repair by this script."
+            return 0
+            ;;
+    esac
+
+    echo "Filesystem check/repair completed."
+}
+
+create_tar_dump() {
+    local part="$1"
+    
+    local mountpoint
+    mountpoint=$(findmnt -n -o TARGET "$part" || true)
+    local temp_mounted=false
+
+    if [[ -z "$mountpoint" ]]; then
+        echo "Partition $part is not currently mounted."
+        if confirm "Temporarily mount $part to perform tar backup?"; then
+            mountpoint=$(mktemp -d /tmp/tuiparted_tar.XXXXXX)
+            if ! mount "$part" "$mountpoint"; then
+                echo "Failed to mount $part at $mountpoint."
+                rmdir "$mountpoint"
+                return 0
+            fi
+            temp_mounted=true
+        else
+            return 0
+        fi
+    fi
+
+    echo "Source Mountpoint: $mountpoint"
+    read -r -e -p "Enter destination tar archive path (e.g., /mnt/storage/os_backup.tar.gz): " TAR_PATH
+    if [[ -z "$TAR_PATH" ]]; then
+        [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+        return 0
+    fi
+
+    TAR_DIR=$(dirname "$TAR_PATH")
+    if [[ ! -d "$TAR_DIR" ]]; then
+        echo "Directory '$TAR_DIR' does not exist."
+        [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+        return 0
+    fi
+
+    if [[ -f "$TAR_PATH" ]]; then
+        if ! confirm "File '$TAR_PATH' already exists. Overwrite?"; then
+            [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+            return 0
+        fi
+    fi
+
+    FORMAT=$(printf "raw (.tar)\ngzip (.tar.gz)\nbzip2 (.tar.bz2)\nxz (.tar.xz)\nzstd (.tar.zst)\n7z (.tar.7z)" | fzf --prompt="Select Compression Format > " || true)
+    if [[ -z "$FORMAT" ]]; then
+        [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+        return 0
+    fi
+
+    EXCLUDE_HOME="n"
+    if confirm "Exclude /home directory contents from backup?"; then
+        EXCLUDE_HOME="y"
+    fi
+
+    EXCLUDES=(
+        --exclude="$TAR_PATH"
+        --exclude="./proc/*" --exclude="./proc/.*"
+        --exclude="./tmp/*" --exclude="./tmp/.*"
+        --exclude="./mnt/*" --exclude="./mnt/.*"
+        --exclude="./dev/*" --exclude="./dev/.*"
+        --exclude="./sys/*" --exclude="./sys/.*"
+        --exclude="./run/*" --exclude="./run/.*"
+        --exclude="./media/*" --exclude="./media/.*"
+        --exclude="./var/log/*" --exclude="./var/log/.*"
+        --exclude="./lost+found"
+    )
+
+    if [[ "$EXCLUDE_HOME" == "y" ]]; then
+        EXCLUDES+=(--exclude="./home/*" --exclude="./home/.*")
+    fi
+
+    if confirm "Start tar backup of $part to '$TAR_PATH'?"; then
+        echo "Creating tar archive..."
+        case "$FORMAT" in
+            "raw (.tar)")
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf "$TAR_PATH" -C "$mountpoint" .
+                ;;
+            "gzip (.tar.gz)")
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf - -C "$mountpoint" . | gzip -c > "$TAR_PATH"
+                ;;
+            "bzip2 (.tar.bz2)")
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf - -C "$mountpoint" . | bzip2 -c > "$TAR_PATH"
+                ;;
+            "xz (.tar.xz)")
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf - -C "$mountpoint" . | xz -c > "$TAR_PATH"
+                ;;
+            "zstd (.tar.zst)")
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf - -C "$mountpoint" . | zstd -c > "$TAR_PATH"
+                ;;
+            "7z (.tar.7z)")
+                if ! command -v 7z >/dev/null 2>&1; then
+                    echo "Error: '7z' command not found. Please install p7zip / 7zip."
+                    [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+                    return 0
+                fi
+                tar --acls --xattrs --warning='no-file-ignored' "${EXCLUDES[@]}" -cpf - -C "$mountpoint" . | 7z a -si "$TAR_PATH"
+                ;;
+        esac
+        echo "Tar dump created successfully at '$TAR_PATH'."
+    fi
+
+    if [[ "$temp_mounted" == "true" ]]; then
+        umount "$mountpoint"
+        rmdir "$mountpoint"
+        echo "Cleaned up temporary mount point."
+    fi
+}
+
+restore_tar_dump() {
+    local part="$1"
+
+    read -r -e -p "Enter source tar archive path: " TAR_PATH
+    [ -z "$TAR_PATH" ] && return 0
+
+    if [[ ! -f "$TAR_PATH" ]]; then
+        echo "Error: Archive '$TAR_PATH' does not exist."
+        return 0
+    fi
+
+    local mountpoint
+    mountpoint=$(findmnt -n -o TARGET "$part" || true)
+    local temp_mounted=false
+
+    if [[ -z "$mountpoint" ]]; then
+        echo "Partition $part is not currently mounted."
+        if confirm "Temporarily mount $part to perform tar restore?"; then
+            mountpoint=$(mktemp -d /tmp/tuiparted_restore.XXXXXX)
+            if ! mount "$part" "$mountpoint"; then
+                echo "Failed to mount $part at $mountpoint."
+                rmdir "$mountpoint"
+                return 0
+            fi
+            temp_mounted=true
+        else
+            return 0
+        fi
+    fi
+
+    echo "Target Location: $mountpoint"
+
+    if confirm "Wipe existing contents in $mountpoint before restoring?"; then
+        echo "Cleaning target directory..."
+        if [[ -n "$mountpoint" && "$mountpoint" != "/" ]]; then
+            find "$mountpoint" -mindepth 1 -delete 2>/dev/null || true
+        fi
+    fi
+
+    if confirm "Restore archive '$TAR_PATH' onto $part ($mountpoint)?"; then
+        echo "Extracting tar archive..."
+        case "$TAR_PATH" in
+            *.zst)
+                zstd -dc "$TAR_PATH" | tar --acls --xattrs -xpf - -C "$mountpoint"
+                ;;
+            *.7z)
+                if ! command -v 7z >/dev/null 2>&1; then
+                    echo "Error: '7z' command not found. Please install p7zip / 7zip."
+                    [[ "$temp_mounted" == "true" ]] && { umount "$mountpoint"; rmdir "$mountpoint"; }
+                    return 0
+                fi
+                7z x -so "$TAR_PATH" | tar --acls --xattrs -xpf - -C "$mountpoint"
+                ;;
+            *)
+                tar --acls --xattrs -xpf "$TAR_PATH" -C "$mountpoint"
+                ;;
+        esac
+        echo "Tar dump restored successfully to $part."
+    fi
+
+    if [[ "$temp_mounted" == "true" ]]; then
+        umount "$mountpoint"
+        rmdir "$mountpoint"
+        echo "Cleaned up temporary mount point."
+    fi
+}
+
+mount_disk_image() {
+    echo "=== Mount Disk Image ==="
+    read -r -e -p "Enter path to disk image (.img, .iso, etc.): " IMG_PATH
+    [ -z "$IMG_PATH" ] && return 0
+
+    if [[ ! -f "$IMG_PATH" ]]; then
+        echo "Error: File '$IMG_PATH' does not exist."
+        return 0
+    fi
+
+    case "$IMG_PATH" in
+        *.gz|*.bz2|*.xz|*.zst|*.7z)
+            echo "Error: Compressed images cannot be mounted directly."
+            echo "Please restore or decompress the image to a raw file (.img) first."
+            return 0
+            ;;
+    esac
+
+    local loop_dev
+    loop_dev=$(losetup -fP --show "$IMG_PATH" 2>/dev/null || true)
+
+    if [[ -z "$loop_dev" ]]; then
+        echo "Failed to attach loop device for '$IMG_PATH'."
+        return 0
+    fi
+
+    udevadm settle
+
+    local part_lines
+    part_lines=$(lsblk -pln -o NAME,TYPE,SIZE,FSTYPE,LABEL "$loop_dev" | awk '$2=="part"' || true)
+
+    local target_dev="$loop_dev"
+    if [[ -n "$part_lines" ]]; then
+        echo "Multiple partitions detected inside image."
+        local selected_line
+        selected_line=$(echo "$part_lines" | fzf --prompt="Select Image Partition to Mount > " || true)
+        if [[ -n "$selected_line" ]]; then
+            target_dev=$(echo "$selected_line" | awk '{print $1}')
+        else
+            losetup -d "$loop_dev" 2>/dev/null || true
+            return 0
+        fi
+    fi
+
+    read -r -e -p "Enter mount directory [default: /mnt/image]: " MOUNTPOINT
+    MOUNTPOINT="${MOUNTPOINT:-/mnt/image}"
+
+    mkdir -p "$MOUNTPOINT"
+
+    local mount_opts=""
+    if confirm "Mount as Read-Only?"; then
+        mount_opts="-o ro"
+    fi
+
+    if mount $mount_opts "$target_dev" "$MOUNTPOINT"; then
+        echo "Successfully mounted $target_dev ($IMG_PATH) at $MOUNTPOINT"
+    else
+        echo "Failed to mount $target_dev at $MOUNTPOINT."
+        losetup -d "$loop_dev" 2>/dev/null || true
+        return 0
+    fi
+}
+
+unmount_disk_image() {
+    echo "=== Unmount Loop Image ==="
+    local mounted_loops
+    mounted_loops=$(losetup -a 2>/dev/null || true)
+
+    if [[ -z "$mounted_loops" ]]; then
+        echo "No active loop devices attached."
+        return 0
+    fi
+
+    local selected
+    selected=$(echo "$mounted_loops" | fzf --prompt="Select Loop Device to Detach > " || true)
+    [ -z "$selected" ] && return 0
+
+    local loop_dev
+    loop_dev=$(echo "$selected" | cut -d: -f1)
+
+    local mounts
+    mounts=$(lsblk -pn -o MOUNTPOINT "$loop_dev" 2>/dev/null | grep -v '^$' || true)
+
+    if [[ -n "$mounts" ]]; then
+        echo "Unmounting associated mount points..."
+        while read -r mpoint; do
+            [[ -n "$mpoint" ]] && umount "$mpoint" || true
+        done <<< "$mounts"
+    fi
+
+    if losetup -d "$loop_dev"; then
+        echo "Successfully detached loop device $loop_dev."
+    else
+        echo "Failed to detach loop device $loop_dev."
+    fi
+}
+
+wipe_storage() {
+    local disk="$1"
+
+    echo "=== WIPE STORAGE DEVICE ==="
+    echo "WARNING: Wiping will IRREVERSIBLY ERASE data and filesystem structures."
+    echo
+
+    local target_scope
+    target_scope=$(printf "Entire Disk ($disk)\nSpecific Partition" | fzf --prompt="Select Wipe Scope > " || true)
+    [ -z "$target_scope" ] && return 0
+
+    local target_dev="$disk"
+    if [[ "$target_scope" == "Specific Partition" ]]; then
+        target_dev=$(select_partition "$disk")
+        [ -z "$target_dev" ] && return 0
+        ensure_unmounted "$target_dev" || return 0
+    else
+        ensure_disk_unmounted "$disk" || return 0
+    fi
+
+    local method
+    method=$(printf "Quick Header Wipe (wipefs + zero headers)\nZero Fill Pass (dd /dev/zero)\nRandom Data Pass (dd /dev/urandom)\nSSD / NVMe Fast Discard (blkdiscard)" | fzf --prompt="Select Wiping Method > " || true)
+    [ -z "$method" ] && return 0
+
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "DANGER: YOU ARE ABOUT TO PERMANENTLY ERASE $target_dev"
+    echo "Target Scope : $target_scope"
+    echo "Wipe Method  : $method"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo
+
+    local dev_name
+    dev_name=$(basename "$target_dev")
+
+    read -r -p "Type '$dev_name' to confirm wiping operation: " CONFIRM_NAME
+    if [[ "$CONFIRM_NAME" != "$dev_name" ]]; then
+        echo "Device name mismatch. Aborting wipe operation."
+        return 0
+    fi
+
+    if ! confirm "FINAL WARNING: Are you 100% sure you want to proceed?"; then
+        echo "Wipe operation cancelled."
+        return 0
+    fi
+
+    echo "Executing wipe on $target_dev..."
+    case "$method" in
+        "Quick Header Wipe (wipefs + zero headers)")
+            wipefs -a -f "$target_dev"
+            dd if=/dev/zero of="$target_dev" bs=1M count=10 status=progress conv=fsync 2>/dev/null || true
+            
+            local size_bytes
+            size_bytes=$(blockdev --getsize64 "$target_dev" 2>/dev/null || echo 0)
+            if [[ "$size_bytes" -gt 10485760 ]]; then
+                local seek_mb=$(( (size_bytes / 1048576) - 10 ))
+                dd if=/dev/zero of="$target_dev" bs=1M seek="$seek_mb" count=10 status=progress conv=fsync 2>/dev/null || true
+            fi
+            ;;
+        "Zero Fill Pass (dd /dev/zero)")
+            wipefs -a -f "$target_dev" 2>/dev/null || true
+            dd if=/dev/zero of="$target_dev" bs=4M status=progress conv=fsync 2>/dev/null || true
+            ;;
+        "Random Data Pass (dd /dev/urandom)")
+            wipefs -a -f "$target_dev" 2>/dev/null || true
+            dd if=/dev/urandom of="$target_dev" bs=4M status=progress conv=fsync 2>/dev/null || true
+            ;;
+        "SSD / NVMe Fast Discard (blkdiscard)")
+            if command -v blkdiscard >/dev/null 2>&1; then
+                blkdiscard -v "$target_dev"
+            else
+                echo "Error: 'blkdiscard' command not found."
+                return 0
+            fi
+            ;;
+    esac
+
+    partprobe "$DISK" 2>/dev/null || true
+    udevadm settle
+    echo "Wipe operation completed successfully on $target_dev."
+}
+
+# --- Main Interactive Loop ---
+while true; do
+    clear
+    DISK_SELECTION=$( (list_disks; echo "Exit") | fzf --prompt="Select Disk > " || true )
+    if [[ -z "$DISK_SELECTION" ]] || [[ "$DISK_SELECTION" == "Exit" ]]; then
+        echo "Exiting tuiparted."
+        exit 0
+    fi
+
+    DISK=$(echo "$DISK_SELECTION" | awk '{print $1}')
+
+    while true; do
+        clear
+        ACTION=$(printf "Create Partition\nCreate Partition Table (GPT/MBR)\nFormat Partition\nLabel Filesystem\nTake Ownership\nCheck / Repair Filesystem\nCreate Tar Dump (OS Backup)\nRestore Tar Dump\nWipe Storage (Disk / Partition)\nDelete Partition\nToggle ESP/Boot Flag\nCreate Disk Image (Backup)\nRestore Disk Image\nMount Disk Image\nUnmount Disk Image\nDisk Info\nChange Disk\nExit" | fzf --prompt="Action ($DISK) > " || true)
         
-        FS=$(printf "fat32\nntfs\nxfs\next4" | fzf --prompt="Select Filesystem > ")
-        
-        if confirm "FORMAT $PART as $FS? ALL DATA WILL BE LOST."; then
-            case "$FS" in
-                "fat32") sudo mkfs.vfat -F 32 "$PART" ;;
-                "ntfs")  sudo mkfs.ntfs -f "$PART" ;;
-                "xfs")   sudo mkfs.xfs -f "$PART" ;;
-                "ext4")  sudo mkfs.ext4 "$PART" ;;
-            esac
-            echo "Successfully formatted $PART."
+        if [[ -z "$ACTION" ]] || [[ "$ACTION" == "Exit" ]]; then
+            echo "Exiting tuiparted."
+            exit 0
+        elif [[ "$ACTION" == "Change Disk" ]]; then
+            break
         fi
-        ;;
 
-    "Delete Partition")
-        PART_NAME=$(lsblk -no NAME,TYPE | grep part | fzf --prompt="Select Partition to Delete > " | awk '{print $1}' | sed 's/[^a-zA-Z0-9]//g')
-        PART="/dev/$PART_NAME"
-        [ -z "$PART_NAME" ] && exit
-        
-        NUM=$(echo "$PART_NAME" | grep -o '[0-9]*$')
-        if confirm "DELETE $PART? This is irreversible."; then
-            sudo parted "$DISK" rm "$NUM"
-        fi
-        ;;
+        case "$ACTION" in
+            "Create Partition")
+                FREE_LINE=$(select_free_space "$DISK")
+                if [[ -n "$FREE_LINE" ]]; then
+                    START_MIB=$(echo "$FREE_LINE" | awk '{print $2}')
+                    END_MIB=$(echo "$FREE_LINE" | awk '{print $4}')
+                    MAX_SIZE=$(echo "$FREE_LINE" | awk '{print $6}')
 
-    "Info")
-        sudo parted "$DISK" print
-        read -p "Press Enter to exit..."
-        ;;
-esac
+                    START_VAL=$(echo "$START_MIB" | sed 's/MiB//' | cut -d. -f1)
+                    if [[ -z "$START_VAL" ]] || [[ "$START_VAL" -lt 1 ]]; then
+                        START_MIB="1MiB"
+                        START_VAL=1
+                    fi
+
+                    echo "Selected region: $START_MIB to $END_MIB (Available: $MAX_SIZE)"
+                    read -r -p "Enter partition size (e.g. 500MiB, 20GiB, or press Enter for ALL [$MAX_SIZE]): " REQ_SIZE
+
+                    if [[ -z "$REQ_SIZE" ]] || [[ "$REQ_SIZE" == "100%" ]]; then
+                        TARGET_END="100%"
+                    else
+                        if [[ "$REQ_SIZE" =~ [Gg][Ii]?[Bb]$ ]]; then
+                            NUM=$(echo "$REQ_SIZE" | sed 's/[^0-9.]//g')
+                            ADD_MIB=$(awk "BEGIN {print int($NUM * 1024)}")
+                            TARGET_END="$((START_VAL + ADD_MIB))MiB"
+                        elif [[ "$REQ_SIZE" =~ [Mm][Ii]?[Bb]$ ]]; then
+                            NUM=$(echo "$REQ_SIZE" | sed 's/[^0-9.]//g')
+                            TARGET_END="$((START_VAL + NUM))MiB"
+                        else
+                            TARGET_END="$REQ_SIZE"
+                        fi
+                    fi
+
+                    FS_TYPE=$(printf "ext4\nxfs\nfat32 (EFI / System)\nntfs\nnone (unformatted)" | fzf --prompt="Select Filesystem > " || true)
+                    if [[ -n "$FS_TYPE" ]]; then
+                        FS_TYPE=$(echo "$FS_TYPE" | awk '{print $1}')
+                        IS_ESP="n"
+                        if [[ "$FS_TYPE" == "fat32" ]]; then
+                            if confirm "Set 'esp' / boot flag on this partition (for UEFI booting)?"; then
+                                IS_ESP="y"
+                            fi
+                        fi
+
+                        if confirm "Create partition from $START_MIB to $TARGET_END ($FS_TYPE)?"; then
+                            parted -s "$DISK" mkpart primary "$START_MIB" "$TARGET_END"
+                            partprobe "$DISK" 2>/dev/null || true
+                            udevadm settle
+
+                            PART=$(lsblk -plno NAME,TYPE "$DISK" | awk '$2=="part" {print $1}' | tail -n 1)
+                            PART_NUM=$(echo "$PART" | grep -o '[0-9]*$')
+
+                            if [[ "$IS_ESP" == "y" ]]; then
+                                parted -s "$DISK" set "$PART_NUM" esp on
+                            fi
+
+                            case "$FS_TYPE" in
+                                ext4)  mkfs.ext4 -F "$PART" ;;
+                                xfs)   mkfs.xfs -f "$PART" ;;
+                                fat32) mkfs.vfat -F 32 "$PART" ;;
+                                ntfs)  mkfs.ntfs -f "$PART" ;;
+                                none)  echo "Partition created without formatting." ;;
+                            esac
+                            echo "Partition $PART successfully configured."
+                        fi
+                    fi
+                fi
+                ;;
+
+            "Create Partition Table (GPT/MBR)")
+                create_partition_table "$DISK"
+                ;;
+
+            "Format Partition")
+                PART=$(select_partition "$DISK")
+                if [[ -n "$PART" ]]; then
+                    if ensure_unmounted "$PART"; then
+                        FS=$(printf "ext4\nxfs\nfat32\nntfs" | fzf --prompt="Select Filesystem > " || true)
+                        if [[ -n "$FS" ]]; then
+                            if confirm "FORMAT $PART as $FS? ALL DATA WILL BE LOST."; then
+                                case "$FS" in
+                                    "fat32") mkfs.vfat -F 32 "$PART" ;;
+                                    "ntfs")  mkfs.ntfs -f "$PART" ;;
+                                    "xfs")   mkfs.xfs -f "$PART" ;;
+                                    "ext4")  mkfs.ext4 -F "$PART" ;;
+                                esac
+                                echo "Successfully formatted $PART as $FS."
+                            fi
+                        fi
+                    fi
+                fi
+                ;;
+
+            "Label Filesystem")
+                PART=$(select_partition "$DISK")
+                [[ -n "$PART" ]] && label_filesystem "$PART"
+                ;;
+
+            "Take Ownership")
+                PART=$(select_partition "$DISK")
+                [[ -n "$PART" ]] && take_ownership "$PART"
+                ;;
+
+            "Check / Repair Filesystem")
+                PART=$(select_partition "$DISK")
+                [[ -n "$PART" ]] && check_repair_fs "$PART"
+                ;;
+
+            "Create Tar Dump (OS Backup)")
+                PART=$(select_partition "$DISK")
+                [[ -n "$PART" ]] && create_tar_dump "$PART"
+                ;;
+
+            "Restore Tar Dump")
+                PART=$(select_partition "$DISK")
+                [[ -n "$PART" ]] && restore_tar_dump "$PART"
+                ;;
+
+            "Wipe Storage (Disk / Partition)")
+                wipe_storage "$DISK"
+                ;;
+
+            "Delete Partition")
+                PART=$(select_partition "$DISK")
+                if [[ -n "$PART" ]]; then
+                    if ensure_unmounted "$PART"; then
+                        NUM=$(echo "$PART" | grep -o '[0-9]*$')
+                        if confirm "DELETE $PART? This is irreversible."; then
+                            parted -s "$DISK" rm "$NUM"
+                            partprobe "$DISK" 2>/dev/null || true
+                            udevadm settle
+                            echo "Deleted partition $PART."
+                        fi
+                    fi
+                fi
+                ;;
+
+            "Toggle ESP/Boot Flag")
+                PART=$(select_partition "$DISK")
+                if [[ -n "$PART" ]]; then
+                    NUM=$(echo "$PART" | grep -o '[0-9]*$')
+                    CURRENT_STATE=$(parted -s "$DISK" print | grep "^ $NUM" | grep -o "esp" || true)
+
+                    if [[ -n "$CURRENT_STATE" ]]; then
+                        ACTION_FLAG="off"
+                    else
+                        ACTION_FLAG="on"
+                    fi
+
+                    if confirm "Set 'esp' flag to '$ACTION_FLAG' on $PART?"; then
+                        parted -s "$DISK" set "$NUM" esp "$ACTION_FLAG"
+                        echo "Partition $PART 'esp' flag set to $ACTION_FLAG."
+                    fi
+                fi
+                ;;
+
+            "Create Disk Image (Backup)")
+                echo "=== Create Disk Image from $DISK ==="
+                if ensure_disk_unmounted "$DISK"; then
+                    read -r -e -p "Enter destination image file path (e.g., /mnt/backup.img.gz): " IMG_PATH
+                    if [[ -n "$IMG_PATH" ]]; then
+                        IMG_DIR=$(dirname "$IMG_PATH")
+                        if [[ -d "$IMG_DIR" ]]; then
+                            CONFIRM_WRITE=true
+                            if [[ -f "$IMG_PATH" ]]; then
+                                confirm "File '$IMG_PATH' already exists. Overwrite?" || CONFIRM_WRITE=false
+                            fi
+
+                            if [[ "$CONFIRM_WRITE" == "true" ]]; then
+                                FORMAT=$(printf "raw (.img)\ngzip (.img.gz)\nbzip2 (.img.bz2)\nxz (.img.xz)\nzstd (.img.zst)\n7z (.img.7z)" | fzf --prompt="Select Compression Format > " || true)
+                                if [[ -n "$FORMAT" ]]; then
+                                    if confirm "Start imaging $DISK to '$IMG_PATH'?"; then
+                                        case "$FORMAT" in
+                                            "raw (.img)")       dd if="$DISK" of="$IMG_PATH" bs=4M status=progress conv=fsync ;;
+                                            "gzip (.img.gz)")   dd if="$DISK" bs=4M status=progress | gzip -c > "$IMG_PATH" ;;
+                                            "bzip2 (.img.bz2)") dd if="$DISK" bs=4M status=progress | bzip2 -c > "$IMG_PATH" ;;
+                                            "xz (.img.xz)")     dd if="$DISK" bs=4M status=progress | xz -c > "$IMG_PATH" ;;
+                                            "zstd (.img.zst)")  dd if="$DISK" bs=4M status=progress | zstd -c > "$IMG_PATH" ;;
+                                            "7z (.img.7z)")
+                                                if command -v 7z >/dev/null 2>&1; then
+                                                    dd if="$DISK" bs=4M status=progress | 7z a -si "$IMG_PATH"
+                                                else
+                                                    echo "Error: '7z' command not found."
+                                                fi
+                                                ;;
+                                        esac
+                                        echo "Disk image backup created successfully at '$IMG_PATH'."
+                                    fi
+                                fi
+                            fi
+                        else
+                            echo "Directory '$IMG_DIR' does not exist."
+                        fi
+                    fi
+                fi
+                ;;
+
+            "Restore Disk Image")
+                echo "=== Restore Disk Image to $DISK ==="
+                read -r -e -p "Enter source image file path: " IMG_PATH
+                if [[ -n "$IMG_PATH" ]]; then
+                    if [[ -f "$IMG_PATH" ]]; then
+                        if ensure_disk_unmounted "$DISK"; then
+                            echo "WARNING: Restoring will OVERWRITE ALL EXISTING DATA on $DISK ($DISK_LINE)."
+                            if confirm "Are you sure you want to write '$IMG_PATH' onto $DISK?"; then
+                                case "$IMG_PATH" in
+                                    *.gz)          gzip -dc "$IMG_PATH" | dd of="$DISK" bs=4M status=progress conv=fsync ;;
+                                    *.bz2|*.bzip2) bzip2 -dc "$IMG_PATH" | dd of="$DISK" bs=4M status=progress conv=fsync ;;
+                                    *.xz)          xz -dc "$IMG_PATH" | dd of="$DISK" bs=4M status=progress conv=fsync ;;
+                                    *.zst)         zstd -dc "$IMG_PATH" | dd of="$DISK" bs=4M status=progress conv=fsync ;;
+                                    *.7z)
+                                        if command -v 7z >/dev/null 2>&1; then
+                                            7z x -so "$IMG_PATH" | dd of="$DISK" bs=4M status=progress conv=fsync
+                                        else
+                                            echo "Error: '7z' command not found."
+                                        fi
+                                        ;;
+                                    *)             dd if="$IMG_PATH" of="$DISK" bs=4M status=progress conv=fsync ;;
+                                esac
+                                partprobe "$DISK" 2>/dev/null || true
+                                udevadm settle
+                                echo "Disk image restored successfully to $DISK."
+                            fi
+                        fi
+                    else
+                        echo "Error: File '$IMG_PATH' does not exist."
+                    fi
+                fi
+                ;;
+
+            "Mount Disk Image")
+                mount_disk_image
+                ;;
+
+            "Unmount Disk Image")
+                unmount_disk_image
+                ;;
+
+            "Disk Info")
+                clear
+                echo "=== Disk Info: $DISK ==="
+                parted "$DISK" print free
+                echo
+                echo "=== Block Device Details ==="
+                lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$DISK"
+                ;;
+        esac
+
+        echo
+        read -r -p "Press Enter to return to menu..." _
+    done
+done
